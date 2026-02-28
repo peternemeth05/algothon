@@ -40,6 +40,7 @@ except ModuleNotFoundError:
 LONDON_LAT = 51.5074
 LONDON_LON = -0.1278
 THAMES_MEASURE = "0006-level-tidal_level-i-15_min-mAOD"
+TIDE_CYCLE_SECS = 12 * 3600 + 25 * 60
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -473,6 +474,9 @@ class AlphaPulseBot(BaseBot):
 
     def _theo_tide_spot(self, books: dict[str, OrderBook]) -> float:
         cached = self.external_cache.get("thames")
+        if cached and cached.get("projected_settle_level_m") is not None:
+            raw = abs(float(cached["projected_settle_level_m"])) * 1000.0
+            return max(0.0, raw)
         if cached and cached.get("settle_level_m") is not None:
             raw = abs(float(cached["settle_level_m"])) * 1000.0
             return max(0.0, raw)
@@ -483,6 +487,8 @@ class AlphaPulseBot(BaseBot):
 
     def _theo_tide_swing(self, books: dict[str, OrderBook]) -> float:
         cached = self.external_cache.get("thames")
+        if cached and cached.get("projected_swing_sum") is not None:
+            return max(0.0, float(cached["projected_swing_sum"]))
         if cached and cached.get("swing_sum") is not None:
             return max(0.0, float(cached["swing_sum"]))
         return self._fallback_mid_or_start("TIDE_SWING", books)
@@ -551,6 +557,107 @@ class AlphaPulseBot(BaseBot):
             if order.volume > order.own_volume:
                 return order
         return None
+
+    def _fit_tide_cycle(
+        self,
+        times: list[datetime],
+        levels: list[float],
+    ) -> dict[str, float] | None:
+        sample_count = min(len(times), len(levels), 128)
+        if sample_count < 16:
+            return None
+
+        fit_times = times[-sample_count:]
+        fit_levels = levels[-sample_count:]
+        anchor = fit_times[-1]
+        omega = 2.0 * math.pi / TIDE_CYCLE_SECS
+
+        n = float(sample_count)
+        sum_sin = 0.0
+        sum_cos = 0.0
+        sum_sin2 = 0.0
+        sum_cos2 = 0.0
+        sum_sin_cos = 0.0
+        sum_y = 0.0
+        sum_y_sin = 0.0
+        sum_y_cos = 0.0
+
+        for stamp, level in zip(fit_times, fit_levels):
+            phase = omega * (stamp - anchor).total_seconds()
+            sin_v = math.sin(phase)
+            cos_v = math.cos(phase)
+            sum_sin += sin_v
+            sum_cos += cos_v
+            sum_sin2 += sin_v * sin_v
+            sum_cos2 += cos_v * cos_v
+            sum_sin_cos += sin_v * cos_v
+            sum_y += level
+            sum_y_sin += level * sin_v
+            sum_y_cos += level * cos_v
+
+        det = (
+            n * (sum_sin2 * sum_cos2 - sum_sin_cos * sum_sin_cos)
+            - sum_sin * (sum_sin * sum_cos2 - sum_sin_cos * sum_cos)
+            + sum_cos * (sum_sin * sum_sin_cos - sum_sin2 * sum_cos)
+        )
+        if abs(det) < 1e-9:
+            return None
+
+        det_offset = (
+            sum_y * (sum_sin2 * sum_cos2 - sum_sin_cos * sum_sin_cos)
+            - sum_sin * (sum_y_sin * sum_cos2 - sum_sin_cos * sum_y_cos)
+            + sum_cos * (sum_y_sin * sum_sin_cos - sum_sin2 * sum_y_cos)
+        )
+        det_sin = (
+            n * (sum_y_sin * sum_cos2 - sum_sin_cos * sum_y_cos)
+            - sum_y * (sum_sin * sum_cos2 - sum_sin_cos * sum_cos)
+            + sum_cos * (sum_sin * sum_y_cos - sum_y_sin * sum_cos)
+        )
+        det_cos = (
+            n * (sum_sin2 * sum_y_cos - sum_y_sin * sum_sin_cos)
+            - sum_sin * (sum_sin * sum_y_cos - sum_y_sin * sum_cos)
+            + sum_y * (sum_sin * sum_sin_cos - sum_sin2 * sum_cos)
+        )
+
+        return {
+            "offset": det_offset / det,
+            "sin_coeff": det_sin / det,
+            "cos_coeff": det_cos / det,
+            "omega": omega,
+            "anchor_ts": anchor.timestamp(),
+        }
+
+    def _predict_tide_level(self, model: dict[str, float], target: datetime) -> float:
+        anchor = datetime.fromtimestamp(model["anchor_ts"], tz=target.tzinfo)
+        phase = model["omega"] * (target - anchor).total_seconds()
+        return (
+            model["offset"]
+            + model["sin_coeff"] * math.sin(phase)
+            + model["cos_coeff"] * math.cos(phase)
+        )
+
+    def _project_tide_swing(self, model: dict[str, float], start: datetime, end: datetime) -> float:
+        if end <= start:
+            return 0.0
+
+        points = [start]
+        stamp = start
+        while True:
+            stamp += timedelta(minutes=15)
+            if stamp >= end:
+                break
+            points.append(stamp)
+        if points[-1] != end:
+            points.append(end)
+
+        swing_sum = 0.0
+        previous = self._predict_tide_level(model, points[0])
+        for stamp in points[1:]:
+            current = self._predict_tide_level(model, stamp)
+            diff_cm = abs(current - previous) * 100.0
+            swing_sum += max(0.0, 20.0 - diff_cm) + max(0.0, diff_cm - 25.0)
+            previous = current
+        return swing_sum
 
     def _structural_bonus(self, symbol: str, fair: float) -> float:
         if symbol != "LON_FLY":
@@ -656,6 +763,17 @@ class AlphaPulseBot(BaseBot):
                 key=lambda idx: abs((times[idx] - proxy_time).total_seconds()),
             )
             settle_level = 0.7 * levels[settle_idx] + 0.3 * latest_level
+            tide_model = self._fit_tide_cycle(times, levels)
+            projected_settle_level = None
+            projected_swing_sum = None
+            if tide_model:
+                modeled_level = self._predict_tide_level(tide_model, settle)
+                projected_settle_level = 0.75 * modeled_level + 0.25 * settle_level
+                projected_swing_sum = self._project_tide_swing(
+                    tide_model,
+                    settle - timedelta(hours=24),
+                    settle,
+                )
             swing_sum = 0.0
             window_start = settle - timedelta(hours=48)
             window_end = settle - timedelta(hours=24)
@@ -667,11 +785,16 @@ class AlphaPulseBot(BaseBot):
                 diff_cm = abs(curr - prev) * 100.0
                 swing_sum += max(0.0, 20.0 - diff_cm) + max(0.0, diff_cm - 25.0)
 
-            return {
+            snapshot = {
                 "latest_level_m": latest_level,
                 "settle_level_m": settle_level,
                 "swing_sum": swing_sum,
             }
+            if projected_settle_level is not None:
+                snapshot["projected_settle_level_m"] = projected_settle_level
+            if projected_swing_sum is not None:
+                snapshot["projected_swing_sum"] = projected_swing_sum
+            return snapshot
         except Exception as exc:
             print(f"Warning: Failed to fetch Thames tide data: {exc}")
             return self.external_cache.get("thames", {})
