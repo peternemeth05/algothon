@@ -208,14 +208,14 @@ class AlphaBot3(BaseBot):
     )
 
     PRODUCT_CONFIGS = {
-        "TIDE_SPOT": ProductConfig(11.0, 5.0, 28, 6.0, 0.35),
-        "TIDE_SWING": ProductConfig(15.0, 7.0, 16, 9.0, 0.15),
-        "WX_SPOT": ProductConfig(10.0, 4.5, 32, 5.0, 0.35),
-        "WX_SUM": ProductConfig(12.0, 5.5, 20, 7.0, 0.20),
-        "LHR_COUNT": ProductConfig(12.0, 5.0, 24, 6.0, 0.30),
-        "LHR_INDEX": ProductConfig(14.0, 6.0, 12, 8.0, 0.10),
-        "LON_ETF": ProductConfig(14.0, 6.0, 24, 8.0, 0.30),
-        "LON_FLY": ProductConfig(20.0, 9.0, 10, 12.0, 0.05),
+        "TIDE_SPOT": ProductConfig(11.0, 5.0, 28, 6.6, 0.35),
+        "TIDE_SWING": ProductConfig(15.0, 7.0, 16, 9.9, 0.15),
+        "WX_SPOT": ProductConfig(10.0, 4.5, 32, 5.5, 0.35),
+        "WX_SUM": ProductConfig(12.0, 5.5, 20, 7.7, 0.20),
+        "LHR_COUNT": ProductConfig(12.0, 5.0, 24, 6.6, 0.30),
+        "LHR_INDEX": ProductConfig(14.0, 6.0, 12, 8.8, 0.10),
+        "LON_ETF": ProductConfig(14.0, 6.0, 24, 8.8, 0.30),
+        "LON_FLY": ProductConfig(20.0, 9.0, 10, 13.2, 0.05),
     }
 
     REFRESH_SECS = 240.0
@@ -446,9 +446,9 @@ class AlphaBot3(BaseBot):
         progress_wx = self._progress_for("WX_SPOT")
         progress_lhr = self._progress_for("LHR_COUNT")
 
-        tide_sigma = 220.0 * (1.0 - progress_tide)
-        wx_sigma = 150.0 * (1.0 - progress_wx)
-        lhr_sigma = 90.0 * (1.0 - progress_lhr)
+        tide_sigma = 242.0 * (1.0 - progress_tide)
+        wx_sigma = 165.0 * (1.0 - progress_wx)
+        lhr_sigma = 99.0 * (1.0 - progress_lhr)
         return math.sqrt(tide_sigma * tide_sigma + wx_sigma * wx_sigma + lhr_sigma * lhr_sigma)
 
     def _signal_for(
