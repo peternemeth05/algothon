@@ -15,6 +15,7 @@ This script is intentionally conservative on exchange traffic:
 from __future__ import annotations
 
 import math
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -259,19 +260,27 @@ class AlphaPulseBot(BaseBot):
 
     def _take_liquidity(self, signal: dict[str, Any], book: OrderBook, fair: float, position: int) -> None:
         symbol = signal["product"]
-        best_bid = self._best_market_bid(book)
-        best_ask = self._best_market_ask(book)
+        best_bid_order = self._best_market_bid_order(book)
+        best_ask_order = self._best_market_ask_order(book)
+        best_bid = best_bid_order.price if best_bid_order else None
+        best_ask = best_ask_order.price if best_ask_order else None
         position_limit = self._position_limit(symbol)
         size = self._size_for_position(symbol, position, signal["edge"])
         if size <= 0:
             return
 
         if best_ask is not None and signal["buy_edge"] >= self.aggress_edge and position < position_limit:
+            size = min(size, best_ask_order.volume - best_ask_order.own_volume)
+            if size <= 0:
+                return
             self._send_ioc(OrderRequest(symbol, best_ask, Side.BUY, size))
             print(f"HIT BUY  {size} {symbol} @ {best_ask:.0f}  theo={fair:.1f}")
             return
 
         if best_bid is not None and signal["sell_edge"] >= self.aggress_edge and position > -position_limit:
+            size = min(size, best_bid_order.volume - best_bid_order.own_volume)
+            if size <= 0:
+                return
             self._send_ioc(OrderRequest(symbol, best_bid, Side.SELL, size))
             print(f"HIT SELL {size} {symbol} @ {best_bid:.0f}  theo={fair:.1f}")
 
@@ -359,12 +368,26 @@ class AlphaPulseBot(BaseBot):
             self._paced(lambda: self.cancel_order(quote.bid_id), "cancel bid")
         if quote.ask_id:
             self._paced(lambda: self.cancel_order(quote.ask_id), "cancel ask")
+        active_orders = self._paced(lambda: self.get_orders(product=quote.product), "refresh active orders")
+        active_ids = {order["id"] for order in active_orders}
+        if quote.bid_id in active_ids or quote.ask_id in active_ids:
+            self.active_quote = QuoteState(
+                product=quote.product,
+                bid_id=quote.bid_id if quote.bid_id in active_ids else None,
+                ask_id=quote.ask_id if quote.ask_id in active_ids else None,
+                bid_price=quote.bid_price if quote.bid_id in active_ids else None,
+                ask_price=quote.ask_price if quote.ask_id in active_ids else None,
+            )
+            print(f"Cancel lag detected for {quote.product}; keeping local quote state in sync.")
+            return
         self.active_quote = None
 
     def _send_ioc(self, order: OrderRequest) -> OrderResponse | None:
         resp = self._paced(lambda: self.send_order(order), "send IOC")
-        if resp and resp.volume > 0:
-            self._paced(lambda: self.cancel_order(resp.id), "cancel IOC remainder")
+        if resp and resp.filled < resp.volume:
+            # The exchange does not expose a true IOC flag, so cancel any remainder immediately.
+            self.cancel_order(resp.id)
+            self.last_rest_at = time.monotonic()
         return resp
 
     def _dynamic_width(self, symbol: str, book: OrderBook, fair: float) -> float:
@@ -510,12 +533,24 @@ class AlphaPulseBot(BaseBot):
         return best_bid if best_bid is not None else best_ask
 
     def _best_market_bid(self, book: OrderBook) -> float | None:
-        prices = [o.price for o in book.buy_orders if o.volume > o.own_volume]
-        return max(prices) if prices else None
+        order = self._best_market_bid_order(book)
+        return order.price if order else None
 
     def _best_market_ask(self, book: OrderBook) -> float | None:
-        prices = [o.price for o in book.sell_orders if o.volume > o.own_volume]
-        return min(prices) if prices else None
+        order = self._best_market_ask_order(book)
+        return order.price if order else None
+
+    def _best_market_bid_order(self, book: OrderBook):
+        for order in book.buy_orders:
+            if order.volume > order.own_volume:
+                return order
+        return None
+
+    def _best_market_ask_order(self, book: OrderBook):
+        for order in book.sell_orders:
+            if order.volume > order.own_volume:
+                return order
+        return None
 
     def _structural_bonus(self, symbol: str, fair: float) -> float:
         if symbol != "LON_FLY":
@@ -643,7 +678,7 @@ class AlphaPulseBot(BaseBot):
 
     def _fetch_flight_snapshot(self) -> dict[str, float]:
         try:
-            now = datetime.now().replace(second=0, microsecond=0)
+            now = datetime.now(ZoneInfo("Europe/London")).replace(second=0, microsecond=0)
             start = (now - timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M")
             end = now.strftime("%Y-%m-%dT%H:%M")
             resp = requests.get(
@@ -685,10 +720,12 @@ class AlphaPulseBot(BaseBot):
 
 
 if __name__ == "__main__":
-    EXCHANGE_URL = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
-    USERNAME = "out of our depth"
-    PASSWORD = "123456789"
-    AERODATABOX_KEY = None  # Optional. Improves the LHR_COUNT estimate.
+    EXCHANGE_URL = os.getenv("CMI_EXCHANGE_URL", "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/")
+    USERNAME = os.getenv("CMI_USERNAME")
+    PASSWORD = os.getenv("CMI_PASSWORD")
+    AERODATABOX_KEY = os.getenv("AERODATABOX_KEY")
+    if not USERNAME or not PASSWORD:
+        raise SystemExit("Set CMI_USERNAME and CMI_PASSWORD before running alphabot.py.")
 
     bot = AlphaPulseBot(
         EXCHANGE_URL,
