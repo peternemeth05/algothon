@@ -157,7 +157,12 @@ class _SSEThread(Thread):
             "Authorization": self._bearer,
             "Accept": "text/event-stream; charset=utf-8",
         }
-        self._http_stream = requests.get(self._url, stream=True, headers=headers, timeout=30)
+        self._http_stream = requests.get(
+            _normalize_request_url(self._url),
+            stream=True,
+            headers=headers,
+            timeout=30,
+        )
         self._client = sseclient.SSEClient(self._http_stream)
 
         for event in self._client.events():
@@ -206,7 +211,7 @@ class BaseBot(ABC):
     @cached_property
     def auth_token(self) -> str:
         response = requests.post(
-            f"{self._cmi_url}/api/user/authenticate",
+            _normalize_request_url(f"{self._cmi_url}/api/user/authenticate"),
             headers=STANDARD_HEADERS,
             json={"username": self.username, "password": self._password},
         )
