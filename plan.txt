@@ -1,3 +1,44 @@
-1. understand the data
-2. understand the theory
-3. 
+
+1. take advantage of data
+    see what data looks like, see if there are any patterns, maybe AR/ML model based on previous values
+
+2. use external data to inform our model
+
+3. take more risk
+
+
+
+no scheduled departures between 22:50 and 06:00
+no schedule arrivals betwee 22:55 and 04:50
+but since lhr_count is the sum of the arrivals and departures, it means that just because there is no traffic
+at night, it doesn't mean the lhr_count will plummet
+so the lhr_count will plateau at the nighttime period
+
+1) Tide spot
+- the tide at noon Sunday
+- will peak
+-> WILL BE HIGH -> people know this already so maybe dont buy too much 
+
+2) Tide swing
+- how much the tide will change in 15 min
+-> 
+
+
+
+3) WX spot
+- The temp*humidity at noon Sunday
+
+-> DONT KNOW HOW TO USE THIS
+
+4) WX sum
+- the sum of temp*humidity from the Start
+-> WILL ALWAYS GO UP -> BUY 
+
+5) LHR count
+- the overall number of arrivals + departures at noon sunday
+-> will go down -> BUY 
+
+
+6) LHR index
+7) LON ETF
+8) LON FLY
