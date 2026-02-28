@@ -20,6 +20,15 @@ import sseclient
 STANDARD_HEADERS = {"Content-Type": "application/json; charset=utf-8"}
 
 
+def _normalize_request_url(url: object) -> str:
+    if isinstance(url, str):
+        return url
+    candidate = getattr(url, "url", None)
+    if isinstance(candidate, str):
+        return candidate
+    raise TypeError(f"Expected request URL string, got {type(url).__name__}: {url!r}")
+
+
 class DictLikeFrozenDataclassMapping(Mapping):
     """Mixin class to allow frozen dataclasses behave like a dict."""
 
@@ -184,7 +193,7 @@ class BaseBot(ABC):
     """
 
     def __init__(self, cmi_url: str, username: str, password: str):
-        self._cmi_url = cmi_url.rstrip("/")
+        self._cmi_url = _normalize_request_url(cmi_url).rstrip("/")
         self.username = username
         self._password = password
         self._sse_thread: _SSEThread | None = None
