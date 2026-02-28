@@ -4,7 +4,7 @@ Core idea:
 - Build direct fair values for TIDE_SPOT, TIDE_SWING, WX_SPOT, WX_SUM from free APIs.
 - Infer the missing flight leg from market prices when no AeroDataBox key is available.
 - Price LON_ETF and LON_FLY off those component theos.
-- Trade only the best edge at any time to respect the 1 cd .uest / second exchange limit.
+- Trade only the best edge at any time to respect the 1 request / second exchange limit.
 
 This script is intentionally conservative on exchange traffic:
 - SSE market stream is used for market data.
@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -77,6 +78,14 @@ class AlphaPulseBot(BaseBot):
     EXTERNAL_REFRESH_SECS = 300.0
     MIN_ACTION_GAP_SECS = 1.05
     EVAL_INTERVAL_SECS = 4.0
+    PRODUCT_SCORE_BIAS = {
+        "TIDE_SPOT": 1.0,
+        "TIDE_SWING": 0.9,
+        "WX_SPOT": 1.0,
+        "WX_SUM": 0.9,
+        "LON_ETF": 1.2,
+        "LON_FLY": 1.35,
+    }
 
     def __init__(
         self,
@@ -176,11 +185,11 @@ class AlphaPulseBot(BaseBot):
 
         if edge >= self.aggress_edge:
             self._cancel_active_quote(except_product=symbol)
-            self._take_liquidity(symbol, book, fair, positions.get(symbol, 0))
+            self._take_liquidity(best, book, fair, positions.get(symbol, 0))
             return
 
         if edge >= self.quote_edge:
-            self._quote_product(symbol, book, fair, positions.get(symbol, 0))
+            self._quote_product(best, book, fair, positions.get(symbol, 0))
             return
 
         self._cancel_active_quote()
@@ -197,7 +206,7 @@ class AlphaPulseBot(BaseBot):
             signal = self._signal_for(symbol, books[symbol], self.theos[symbol], positions.get(symbol, 0))
             if signal:
                 ranked.append(signal)
-        ranked.sort(key=lambda item: item["edge"], reverse=True)
+        ranked.sort(key=lambda item: item["score"], reverse=True)
         return ranked
 
     def _signal_for(
@@ -226,29 +235,37 @@ class AlphaPulseBot(BaseBot):
         if edge <= 0:
             return None
 
+        structural_bonus = self._structural_bonus(symbol, fair)
+        score = (edge + structural_bonus) * self.PRODUCT_SCORE_BIAS.get(symbol, 1.0)
+
         return {
             "product": symbol,
             "edge": edge,
+            "score": score,
+            "buy_edge": max(0.0, buy_edge),
+            "sell_edge": max(0.0, sell_edge),
             "direction": "BUY" if buy_edge >= sell_edge else "SELL",
         }
 
-    def _take_liquidity(self, symbol: str, book: OrderBook, fair: float, position: int) -> None:
+    def _take_liquidity(self, signal: dict[str, Any], book: OrderBook, fair: float, position: int) -> None:
+        symbol = signal["product"]
         best_bid = self._best_market_bid(book)
         best_ask = self._best_market_ask(book)
-        size = self._size_for_position(position)
+        size = self._size_for_position(position, signal["edge"])
         if size <= 0:
             return
 
-        if best_ask is not None and fair - best_ask >= self.aggress_edge and position < self.max_position:
+        if best_ask is not None and signal["buy_edge"] >= self.aggress_edge and position < self.max_position:
             self._send_ioc(OrderRequest(symbol, best_ask, Side.BUY, size))
             print(f"HIT BUY  {size} {symbol} @ {best_ask:.0f}  theo={fair:.1f}")
             return
 
-        if best_bid is not None and best_bid - fair >= self.aggress_edge and position > -self.max_position:
+        if best_bid is not None and signal["sell_edge"] >= self.aggress_edge and position > -self.max_position:
             self._send_ioc(OrderRequest(symbol, best_bid, Side.SELL, size))
             print(f"HIT SELL {size} {symbol} @ {best_bid:.0f}  theo={fair:.1f}")
 
-    def _quote_product(self, symbol: str, book: OrderBook, fair: float, position: int) -> None:
+    def _quote_product(self, signal: dict[str, Any], book: OrderBook, fair: float, position: int) -> None:
+        symbol = signal["product"]
         product = self.products.get(symbol)
         if not product:
             return
@@ -256,7 +273,7 @@ class AlphaPulseBot(BaseBot):
         best_bid = self._best_market_bid(book)
         best_ask = self._best_market_ask(book)
         tick = product.tickSize or 1.0
-        size = self._size_for_position(position)
+        size = self._size_for_position(position, signal["edge"])
         if size <= 0:
             self._cancel_active_quote()
             return
@@ -273,8 +290,23 @@ class AlphaPulseBot(BaseBot):
         if bid <= 0 or ask <= bid:
             return
 
+        directional_imbalance = abs(signal["buy_edge"] - signal["sell_edge"])
+        one_sided = directional_imbalance >= self.quote_edge
+
+        target_bid = bid if signal["buy_edge"] >= self.quote_edge and position < self.max_position else None
+        target_ask = ask if signal["sell_edge"] >= self.quote_edge and position > -self.max_position else None
+        if not one_sided:
+            if target_bid is None and position < self.max_position:
+                target_bid = bid
+            if target_ask is None and position > -self.max_position:
+                target_ask = ask
+
+        if target_bid is None and target_ask is None:
+            self._cancel_active_quote()
+            return
+
         if self.active_quote and self.active_quote.product == symbol:
-            unchanged = self.active_quote.bid_price == bid and self.active_quote.ask_price == ask
+            unchanged = self.active_quote.bid_price == target_bid and self.active_quote.ask_price == target_ask
             if unchanged:
                 return
 
@@ -282,19 +314,27 @@ class AlphaPulseBot(BaseBot):
 
         bid_resp = None
         ask_resp = None
-        if position < self.max_position:
-            bid_resp = self._paced(lambda: self.send_order(OrderRequest(symbol, bid, Side.BUY, size)), "quote bid")
-        if position > -self.max_position:
-            ask_resp = self._paced(lambda: self.send_order(OrderRequest(symbol, ask, Side.SELL, size)), "quote ask")
+        if target_bid is not None:
+            bid_resp = self._paced(
+                lambda: self.send_order(OrderRequest(symbol, target_bid, Side.BUY, size)),
+                "quote bid",
+            )
+        if target_ask is not None:
+            ask_resp = self._paced(
+                lambda: self.send_order(OrderRequest(symbol, target_ask, Side.SELL, size)),
+                "quote ask",
+            )
 
         self.active_quote = QuoteState(
             product=symbol,
             bid_id=bid_resp.id if bid_resp else None,
             ask_id=ask_resp.id if ask_resp else None,
-            bid_price=bid if bid_resp else None,
-            ask_price=ask if ask_resp else None,
+            bid_price=target_bid if bid_resp else None,
+            ask_price=target_ask if ask_resp else None,
         )
-        print(f"QUOTE {symbol:>9}  {size}@{bid:.0f} / {size}@{ask:.0f}  theo={fair:.1f}")
+        bid_text = f"{size}@{target_bid:.0f}" if target_bid is not None else "-"
+        ask_text = f"{size}@{target_ask:.0f}" if target_ask is not None else "-"
+        print(f"QUOTE {symbol:>9}  {bid_text} / {ask_text}  theo={fair:.1f}")
 
     def _cancel_active_quote(self, except_product: str | None = None) -> None:
         quote = self.active_quote
@@ -325,10 +365,11 @@ class AlphaPulseBot(BaseBot):
             return max(6.0, spread / 2.0)
         return max(4.0, spread / 2.0)
 
-    def _size_for_position(self, position: int) -> int:
+    def _size_for_position(self, position: int, edge: float = 0.0) -> int:
         utilization = abs(position) / max(self.max_position, 1)
         scale = 1.0 - clamp(utilization, 0.0, 0.85)
-        return max(1, int(round(self.base_order_size * scale)))
+        edge_boost = 1.0 + clamp(edge / max(self.aggress_edge, 1.0), 0.0, 1.0)
+        return max(1, int(round(self.base_order_size * scale * edge_boost)))
 
     def _build_theos(self, books: dict[str, OrderBook]) -> dict[str, float]:
         tide_spot = self._theo_tide_spot(books)
@@ -349,6 +390,10 @@ class AlphaPulseBot(BaseBot):
             "LON_FLY": lon_fly,
         }
 
+        etf_mid = self._mid(books.get("LON_ETF"))
+        if etf_mid is not None:
+            theos["LON_FLY"] = 0.8 * theos["LON_FLY"] + 0.2 * fly_payoff(etf_mid)
+
         # If the market in an unmodeled product is tighter than our model, blend lightly with the midpoint.
         for symbol in ("TIDE_SWING", "WX_SUM"):
             mid = self._mid(books.get(symbol))
@@ -358,6 +403,9 @@ class AlphaPulseBot(BaseBot):
 
     def _theo_tide_spot(self, books: dict[str, OrderBook]) -> float:
         cached = self.external_cache.get("thames")
+        if cached and cached.get("settle_level_m") is not None:
+            raw = abs(float(cached["settle_level_m"])) * 1000.0
+            return max(0.0, raw)
         if cached and cached.get("latest_level_m") is not None:
             raw = abs(float(cached["latest_level_m"])) * 1000.0
             return max(0.0, raw)
@@ -371,6 +419,8 @@ class AlphaPulseBot(BaseBot):
 
     def _theo_wx_spot(self, books: dict[str, OrderBook]) -> float:
         cached = self.external_cache.get("weather")
+        if cached and cached.get("wx_spot_settle") is not None:
+            return max(0.0, float(cached["wx_spot_settle"]))
         if cached and cached.get("wx_spot") is not None:
             return max(0.0, float(cached["wx_spot"]))
         return self._fallback_mid_or_start("WX_SPOT", books)
@@ -420,6 +470,15 @@ class AlphaPulseBot(BaseBot):
         prices = [o.price for o in book.sell_orders if o.volume > o.own_volume]
         return min(prices) if prices else None
 
+    def _structural_bonus(self, symbol: str, fair: float) -> float:
+        if symbol != "LON_FLY":
+            return 0.0
+        etf_mid = self._mid(self.books.get("LON_ETF"))
+        if etf_mid is None:
+            return 0.0
+        synthetic = fly_payoff(etf_mid)
+        return abs(fair - synthetic) * 0.25
+
     def _refresh_external_data(self, force: bool = False) -> None:
         now = time.monotonic()
         if not force and now - self.external_updated_at < self.EXTERNAL_REFRESH_SECS:
@@ -446,29 +505,46 @@ class AlphaPulseBot(BaseBot):
         )
         resp.raise_for_status()
         raw = resp.json()["minutely_15"]
+        times = []
+        for value in raw["time"]:
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=ZoneInfo("Europe/London"))
+            else:
+                parsed = parsed.astimezone(ZoneInfo("Europe/London"))
+            times.append(parsed)
         temps_c = raw["temperature_2m"]
         humids = raw["relative_humidity_2m"]
         current_idx = len(temps_c) // 2
+        settle = self._next_settlement_time()
+        window_start = settle - timedelta(hours=24)
+        settle_idx = min(range(len(times)), key=lambda idx: abs((times[idx] - settle).total_seconds()))
 
         current_temp_f = temps_c[current_idx] * 9.0 / 5.0 + 32.0
         current_humidity = humids[current_idx]
         current_spot = current_temp_f * current_humidity
+        settle_temp_f = temps_c[settle_idx] * 9.0 / 5.0 + 32.0
+        settle_humidity = humids[settle_idx]
+        settle_spot = settle_temp_f * settle_humidity
 
         wx_sum = 0.0
-        for temp_c, humidity in zip(temps_c, humids):
+        for stamp, temp_c, humidity in zip(times, temps_c, humids):
+            if stamp < window_start or stamp > settle:
+                continue
             temp_f = temp_c * 9.0 / 5.0 + 32.0
             wx_sum += temp_f * humidity
         wx_sum /= 100.0
 
         return {
             "wx_spot": current_spot,
+            "wx_spot_settle": settle_spot,
             "wx_sum": wx_sum,
         }
 
     def _fetch_thames_snapshot(self) -> dict[str, float]:
         resp = requests.get(
             f"https://environment.data.gov.uk/flood-monitoring/id/measures/{THAMES_MEASURE}/readings",
-            params={"_sorted": "", "_limit": 97},
+            params={"_sorted": "", "_limit": 193},
             timeout=10,
         )
         resp.raise_for_status()
@@ -476,15 +552,25 @@ class AlphaPulseBot(BaseBot):
         if not items:
             return {}
 
+        times = [datetime.fromisoformat(item["dateTime"].replace("Z", "+00:00")).astimezone(ZoneInfo("Europe/London")) for item in items]
         levels = [float(item["value"]) for item in items]
         latest_level = levels[-1]
+        settle = self._next_settlement_time()
+        proxy_time = settle - timedelta(hours=24)
+        settle_idx = min(range(len(times)), key=lambda idx: abs((times[idx] - proxy_time).total_seconds()))
+        settle_level = 0.7 * levels[settle_idx] + 0.3 * latest_level
         swing_sum = 0.0
-        for prev, curr in zip(levels, levels[1:]):
+        window_start = settle - timedelta(hours=48)
+        window_end = settle - timedelta(hours=24)
+        for prev_t, curr_t, prev, curr in zip(times, times[1:], levels, levels[1:]):
+            if prev_t < window_start or curr_t > window_end:
+                continue
             diff_cm = abs(curr - prev) * 100.0
             swing_sum += max(0.0, 20.0 - diff_cm) + max(0.0, diff_cm - 25.0)
 
         return {
             "latest_level_m": latest_level,
+            "settle_level_m": settle_level,
             "swing_sum": swing_sum,
         }
 
@@ -509,6 +595,13 @@ class AlphaPulseBot(BaseBot):
             "count": float(len(arrivals) + len(departures)),
         }
 
+    def _next_settlement_time(self) -> datetime:
+        now = datetime.now(ZoneInfo("Europe/London"))
+        settle = now.replace(hour=12, minute=0, second=0, microsecond=0)
+        if now >= settle:
+            settle += timedelta(days=1)
+        return settle
+
     def _paced(self, func, label: str) -> Any:
         wait = self.MIN_ACTION_GAP_SECS - (time.monotonic() - self.last_rest_at)
         if wait > 0:
@@ -520,6 +613,23 @@ class AlphaPulseBot(BaseBot):
         return result
 
 
+if __name__ == "__main__":
+    EXCHANGE_URL = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
+    USERNAME = "REPLACE_WITH_USERNAME"
+    PASSWORD = "REPLACE_WITH_PASSWORD"
+    AERODATABOX_KEY = None  # Optional. Improves the LHR_COUNT estimate.
+
+    bot = AlphaPulseBot(
+        EXCHANGE_URL,
+        USERNAME,
+        PASSWORD,
+        aerodatabox_key=AERODATABOX_KEY,
+        base_order_size=3,
+        max_position=15,
+        aggress_edge=14.0,
+        quote_edge=7.0,
+    )
+    bot.run()
 if __name__ == "__main__":
     EXCHANGE_URL = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
     USERNAME = "out of our depth"
