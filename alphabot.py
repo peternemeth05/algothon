@@ -538,109 +538,133 @@ class AlphaPulseBot(BaseBot):
         self.external_updated_at = now
 
     def _fetch_weather_snapshot(self) -> dict[str, float]:
-        resp = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": LONDON_LAT,
-                "longitude": LONDON_LON,
-                "minutely_15": "temperature_2m,relative_humidity_2m",
-                "past_minutely_15": 96,
-                "forecast_minutely_15": 96,
-                "timezone": "Europe/London",
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        raw = resp.json()["minutely_15"]
-        times = []
-        for value in raw["time"]:
-            parsed = datetime.fromisoformat(value)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=ZoneInfo("Europe/London"))
-            else:
-                parsed = parsed.astimezone(ZoneInfo("Europe/London"))
-            times.append(parsed)
-        temps_c = raw["temperature_2m"]
-        humids = raw["relative_humidity_2m"]
-        current_idx = len(temps_c) // 2
-        settle = self._next_settlement_time()
-        window_start = settle - timedelta(hours=24)
-        settle_idx = min(range(len(times)), key=lambda idx: abs((times[idx] - settle).total_seconds()))
+        try:
+            resp = requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": LONDON_LAT,
+                    "longitude": LONDON_LON,
+                    "minutely_15": "temperature_2m,relative_humidity_2m",
+                    "past_minutely_15": 96,
+                    "forecast_minutely_15": 96,
+                    "timezone": "Europe/London",
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            raw = resp.json()["minutely_15"]
+            times = []
+            for value in raw["time"]:
+                parsed = datetime.fromisoformat(value)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=ZoneInfo("Europe/London"))
+                else:
+                    parsed = parsed.astimezone(ZoneInfo("Europe/London"))
+                times.append(parsed)
+            temps_c = raw["temperature_2m"]
+            humids = raw["relative_humidity_2m"]
+            current_idx = len(temps_c) // 2
+            settle = self._next_settlement_time()
+            window_start = settle - timedelta(hours=24)
+            settle_idx = min(
+                range(len(times)),
+                key=lambda idx: abs((times[idx] - settle).total_seconds()),
+            )
 
-        current_temp_f = temps_c[current_idx] * 9.0 / 5.0 + 32.0
-        current_humidity = humids[current_idx]
-        current_spot = current_temp_f * current_humidity
-        settle_temp_f = temps_c[settle_idx] * 9.0 / 5.0 + 32.0
-        settle_humidity = humids[settle_idx]
-        settle_spot = settle_temp_f * settle_humidity
+            current_temp_f = temps_c[current_idx] * 9.0 / 5.0 + 32.0
+            current_humidity = humids[current_idx]
+            current_spot = current_temp_f * current_humidity
 
-        wx_sum = 0.0
-        for stamp, temp_c, humidity in zip(times, temps_c, humids):
-            if stamp < window_start or stamp > settle:
-                continue
-            temp_f = temp_c * 9.0 / 5.0 + 32.0
-            wx_sum += temp_f * humidity
-        wx_sum /= 100.0
+            settle_temp_f = temps_c[settle_idx] * 9.0 / 5.0 + 32.0
+            settle_humidity = humids[settle_idx]
+            settle_spot = settle_temp_f * settle_humidity
 
-        return {
-            "wx_spot": current_spot,
-            "wx_spot_settle": settle_spot,
-            "wx_sum": wx_sum,
-        }
+            wx_sum = 0.0
+            for stamp, temp_c, humidity in zip(times, temps_c, humids):
+                if stamp < window_start or stamp > settle:
+                    continue
+                temp_f = temp_c * 9.0 / 5.0 + 32.0
+                wx_sum += temp_f * humidity
+            wx_sum /= 100.0
+
+            return {
+                "wx_spot": current_spot,
+                "wx_spot_settle": settle_spot,
+                "wx_sum": wx_sum,
+            }
+        except Exception as exc:
+            print(f"Warning: Failed to fetch weather data: {exc}")
+            return self.external_cache.get("weather", {})
 
     def _fetch_thames_snapshot(self) -> dict[str, float]:
-        resp = requests.get(
-            f"https://environment.data.gov.uk/flood-monitoring/id/measures/{THAMES_MEASURE}/readings",
-            params={"_sorted": "", "_limit": 193},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        items = resp.json().get("items", [])
-        if not items:
-            return {}
+        try:
+            resp = requests.get(
+                f"https://environment.data.gov.uk/flood-monitoring/id/measures/{THAMES_MEASURE}/readings",
+                params={"_sorted": "", "_limit": 193},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            items = resp.json().get("items", [])
+            if not items:
+                return self.external_cache.get("thames", {})
 
-        times = [datetime.fromisoformat(item["dateTime"].replace("Z", "+00:00")).astimezone(ZoneInfo("Europe/London")) for item in items]
-        levels = [float(item["value"]) for item in items]
-        latest_level = levels[-1]
-        settle = self._next_settlement_time()
-        proxy_time = settle - timedelta(hours=24)
-        settle_idx = min(range(len(times)), key=lambda idx: abs((times[idx] - proxy_time).total_seconds()))
-        settle_level = 0.7 * levels[settle_idx] + 0.3 * latest_level
-        swing_sum = 0.0
-        window_start = settle - timedelta(hours=48)
-        window_end = settle - timedelta(hours=24)
-        for prev_t, curr_t, prev, curr in zip(times, times[1:], levels, levels[1:]):
-            if prev_t < window_start or curr_t > window_end:
-                continue
-            diff_cm = abs(curr - prev) * 100.0
-            swing_sum += max(0.0, 20.0 - diff_cm) + max(0.0, diff_cm - 25.0)
+            times = [
+                datetime.fromisoformat(item["dateTime"].replace("Z", "+00:00")).astimezone(ZoneInfo("Europe/London"))
+                for item in items
+            ]
+            levels = [float(item["value"]) for item in items]
+            latest_level = levels[-1]
+            settle = self._next_settlement_time()
+            proxy_time = settle - timedelta(hours=24)
+            settle_idx = min(
+                range(len(times)),
+                key=lambda idx: abs((times[idx] - proxy_time).total_seconds()),
+            )
+            settle_level = 0.7 * levels[settle_idx] + 0.3 * latest_level
+            swing_sum = 0.0
+            window_start = settle - timedelta(hours=48)
+            window_end = settle - timedelta(hours=24)
+            for prev_t, curr_t, prev, curr in zip(
+                times, times[1:], levels, levels[1:]
+            ):
+                if prev_t < window_start or curr_t > window_end:
+                    continue
+                diff_cm = abs(curr - prev) * 100.0
+                swing_sum += max(0.0, 20.0 - diff_cm) + max(0.0, diff_cm - 25.0)
 
-        return {
-            "latest_level_m": latest_level,
-            "settle_level_m": settle_level,
-            "swing_sum": swing_sum,
-        }
+            return {
+                "latest_level_m": latest_level,
+                "settle_level_m": settle_level,
+                "swing_sum": swing_sum,
+            }
+        except Exception as exc:
+            print(f"Warning: Failed to fetch Thames tide data: {exc}")
+            return self.external_cache.get("thames", {})
 
     def _fetch_flight_snapshot(self) -> dict[str, float]:
-        now = datetime.now().replace(second=0, microsecond=0)
-        start = (now - timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M")
-        end = now.strftime("%Y-%m-%dT%H:%M")
-        resp = requests.get(
-            f"https://aerodatabox.p.rapidapi.com/flights/airports/iata/LHR/{start}/{end}",
-            params={"direction": "Both"},
-            headers={
-                "x-rapidapi-host": "aerodatabox.p.rapidapi.com",
-                "x-rapidapi-key": self.aerodatabox_key,
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        arrivals = payload.get("arrivals", [])
-        departures = payload.get("departures", [])
-        return {
-            "count": float(len(arrivals) + len(departures)),
-        }
+        try:
+            now = datetime.now().replace(second=0, microsecond=0)
+            start = (now - timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M")
+            end = now.strftime("%Y-%m-%dT%H:%M")
+            resp = requests.get(
+                f"https://aerodatabox.p.rapidapi.com/flights/airports/iata/LHR/{start}/{end}",
+                params={"direction": "Both"},
+                headers={
+                    "x-rapidapi-host": "aerodatabox.p.rapidapi.com",
+                    "x-rapidapi-key": self.aerodatabox_key,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            arrivals = payload.get("arrivals", [])
+            departures = payload.get("departures", [])
+            return {
+                "count": float(len(arrivals) + len(departures)),
+            }
+        except Exception as exc:
+            print(f"Warning: Failed to fetch flight data: {exc}")
+            return self.external_cache.get("flights", {})
 
     def _next_settlement_time(self) -> datetime:
         now = datetime.now(ZoneInfo("Europe/London"))
@@ -658,6 +682,8 @@ class AlphaPulseBot(BaseBot):
         if label:
             pass
         return result
+
+
 if __name__ == "__main__":
     EXCHANGE_URL = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
     USERNAME = "out of our depth"
