@@ -522,8 +522,8 @@ class AlphaPulseBot(BaseBot):
 
 if __name__ == "__main__":
     EXCHANGE_URL = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
-    USERNAME = "REPLACE_WITH_USERNAME"
-    PASSWORD = "REPLACE_WITH_PASSWORD"
+    USERNAME = "out of our depth"
+    PASSWORD = "123456789"
     AERODATABOX_KEY = None  # Optional. Improves the LHR_COUNT estimate.
 
     bot = AlphaPulseBot(
