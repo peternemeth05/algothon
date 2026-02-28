@@ -257,7 +257,7 @@ class BaseBot(ABC):
         if self._trade_watermark:
             params["from"] = self._trade_watermark
         response = requests.get(
-            f"{self._cmi_url}/api/trade",
+            _normalize_request_url(f"{self._cmi_url}/api/trade"),
             params=params,
             headers=self._auth_headers(),
         )
@@ -290,7 +290,7 @@ class BaseBot(ABC):
 
     def send_order(self, order: OrderRequest) -> OrderResponse | None:
         response = requests.post(
-            f"{self._cmi_url}/api/order",
+            _normalize_request_url(f"{self._cmi_url}/api/order"),
             json=asdict(order),
             headers=self._auth_headers(),
         )
@@ -315,7 +315,10 @@ class BaseBot(ABC):
         return results
 
     def cancel_order(self, order_id: str) -> None:
-        requests.delete(f"{self._cmi_url}/api/order/{order_id}", headers=self._auth_headers())
+        requests.delete(
+            _normalize_request_url(f"{self._cmi_url}/api/order/{order_id}"),
+            headers=self._auth_headers(),
+        )
 
     def cancel_all_orders(self) -> None:
         orders = self.get_orders()
@@ -328,20 +331,23 @@ class BaseBot(ABC):
     def get_orders(self, product: str | None = None) -> list[dict]:
         params = {"productsymbol": product} if product else {}
         response = requests.get(
-            f"{self._cmi_url}/api/order/current-user",
+            _normalize_request_url(f"{self._cmi_url}/api/order/current-user"),
             params=params,
             headers=self._auth_headers(),
         )
         return response.json() if response.ok else []
 
     def get_products(self) -> list[Product]:
-        response = requests.get(f"{self._cmi_url}/api/product", headers=self._auth_headers())
+        response = requests.get(
+            _normalize_request_url(f"{self._cmi_url}/api/product"),
+            headers=self._auth_headers(),
+        )
         response.raise_for_status()
         return [Product(**p) for p in response.json()]
 
     def get_positions(self) -> dict[str, int]:
         response = requests.get(
-            f"{self._cmi_url}/api/position/current-user",
+            _normalize_request_url(f"{self._cmi_url}/api/position/current-user"),
             headers=self._auth_headers(),
         )
         if response.ok:
@@ -350,7 +356,7 @@ class BaseBot(ABC):
 
     def get_orderbook(self, product: str) -> OrderBook:
         response = requests.get(
-            f"{self._cmi_url}/api/product/{product}/order-book/current-user",
+            _normalize_request_url(f"{self._cmi_url}/api/product/{product}/order-book/current-user"),
             headers=self._auth_headers(),
         )
         response.raise_for_status()
@@ -367,7 +373,7 @@ class BaseBot(ABC):
 
     def get_pnl(self) -> dict:
         response = requests.get(
-            f"{self._cmi_url}/api/profit/current-user",
+            _normalize_request_url(f"{self._cmi_url}/api/profit/current-user"),
             headers=self._auth_headers(),
         )
         return response.json() if response.ok else {}
