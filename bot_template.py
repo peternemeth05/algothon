@@ -253,8 +253,9 @@ class BaseBot(ABC):
             return self.trades
 
         new_trades = []
+        trade_fields = {f.name for f in Trade.__dataclass_fields__.values()}
         for raw in response.json():
-            trade = Trade(**raw)
+            trade = Trade(**{k: v for k, v in raw.items() if k in trade_fields})
             if self._trade_watermark is None or trade.timestamp > self._trade_watermark:
                 new_trades.append(trade)
 

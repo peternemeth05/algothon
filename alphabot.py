@@ -720,12 +720,20 @@ class AlphaPulseBot(BaseBot):
 
 
 if __name__ == "__main__":
-    EXCHANGE_URL = os.getenv("CMI_EXCHANGE_URL", "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/")
+    import dotenv
+
+    dotenv.load_dotenv()
+
+    EXCHANGE_URL = os.getenv(
+        "CMI_EXCHANGE_URL", "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
+    )
     USERNAME = os.getenv("CMI_USERNAME")
     PASSWORD = os.getenv("CMI_PASSWORD")
     AERODATABOX_KEY = os.getenv("AERODATABOX_KEY")
     if not USERNAME or not PASSWORD:
-        raise SystemExit("Set CMI_USERNAME and CMI_PASSWORD before running alphabot.py.")
+        raise SystemExit(
+            "Set CMI_USERNAME and CMI_PASSWORD in .env before running alphabot.py."
+        )
 
     bot = AlphaPulseBot(
         EXCHANGE_URL,
