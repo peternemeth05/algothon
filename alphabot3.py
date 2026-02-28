@@ -220,7 +220,7 @@ class AlphaBot3(BaseBot):
 
     REFRESH_SECS = 240.0
     EVAL_SECS = 2.0
-    MIN_REST_GAP = 1.05
+    MIN_REST_GAP = 1.1
     MAX_ACTIVE_QUOTES = 2
     SETTLEMENT_GUARD_MINUTES = 8
     SETTLEMENT_GUARD_MULTIPLIER = 4.0
@@ -472,10 +472,31 @@ class AlphaBot3(BaseBot):
         ml_adjust = self._ml_adjust(symbol, features, mid)
         effective_fair = structural_fair + config.ml_weight * ml_adjust
 
-        buy_edge = effective_fair - best_ask if best_ask is not None and position < config.max_position else float("-inf")
-        sell_edge = best_bid - effective_fair if best_bid is not None and position > -config.max_position else float("-inf")
+        # Allow inventory-reducing trades even at position limits.
+        # At +max_position: block new buys, but always allow sells.
+        # At -max_position: block new sells, but always allow buys.
+        can_buy = position < config.max_position
+        can_sell = position > -config.max_position
+        buy_edge = effective_fair - best_ask if best_ask is not None and can_buy else float("-inf")
+        sell_edge = best_bid - effective_fair if best_bid is not None and can_sell else float("-inf")
         edge = max(buy_edge, sell_edge, 0.0)
         if edge <= 0.0:
+            # Even with no edge, generate a signal when at extreme inventory
+            # so the quoting logic can skew prices to encourage mean-reversion.
+            inventory_ratio = abs(position) / max(config.max_position, 1)
+            if inventory_ratio >= 0.85:
+                # Synthetic signal to let _quote run with strong skew
+                direction = -1.0 if position > 0 else 1.0
+                return {
+                    "product": symbol,
+                    "edge": config.quote_edge,  # minimum passable edge
+                    "score": config.quote_edge * 0.5,
+                    "buy_edge": config.quote_edge if direction > 0 else 0.0,
+                    "sell_edge": config.quote_edge if direction < 0 else 0.0,
+                    "effective_fair": effective_fair,
+                    "progress": progress,
+                    "ml_adjust": ml_adjust,
+                }
             return None
 
         direction = 1.0 if buy_edge >= sell_edge else -1.0
@@ -590,7 +611,14 @@ class AlphaBot3(BaseBot):
         progress = signal["progress"]
         half_width *= 1.15 - 0.25 * progress
 
-        skew = clamp(position / max(config.max_position, 1), -1.0, 1.0) * (2.5 + 2.5 * (1.0 - progress))
+        # Inventory skewing: aggressively move prices to encourage
+        # the market to trade us back toward a neutral position.
+        inventory_ratio = clamp(position / max(config.max_position, 1), -1.0, 1.0)
+        base_skew = 2.5 + 2.5 * (1.0 - progress)
+        # At extreme positions (>85% utilized), add extra skew to
+        # make the inventory-reducing side much more attractive.
+        extreme_bonus = max(0.0, abs(inventory_ratio) - 0.85) * 15.0
+        skew = inventory_ratio * (base_skew + extreme_bonus)
         bid_price = math.floor((fair - half_width - skew) / tick) * tick
         ask_price = math.ceil((fair + half_width - skew) / tick) * tick
 
@@ -601,8 +629,11 @@ class AlphaBot3(BaseBot):
         if bid_price <= 0 or ask_price <= bid_price:
             return
 
-        target_bid = bid_price if signal["buy_edge"] >= config.quote_edge and position < config.max_position else None
-        target_ask = ask_price if signal["sell_edge"] >= config.quote_edge and position > -config.max_position else None
+        # Always allow the inventory-reducing side to quote, even at position limits.
+        can_bid = position < config.max_position
+        can_ask = position > -config.max_position
+        target_bid = bid_price if signal["buy_edge"] >= config.quote_edge and can_bid else None
+        target_ask = ask_price if signal["sell_edge"] >= config.quote_edge and can_ask else None
         if target_bid is None and target_ask is None:
             self._cancel_quote(symbol)
             return
