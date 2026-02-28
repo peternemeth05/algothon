@@ -151,8 +151,13 @@ class AlphaPulseBot(BaseBot):
         self._maybe_evaluate()
 
     def on_trades(self, trade: Trade) -> None:
-        # Only our fills are streamed here.
-        signed = trade.volume if trade.buyer == self.username else -trade.volume
+        if trade.buyer == self.username:
+            signed = trade.volume
+        elif trade.seller == self.username:
+            signed = -trade.volume
+        else:
+            return
+
         with self._lock:
             self.positions[trade.product] = self.positions.get(trade.product, 0) + signed
         side = "BOUGHT" if signed > 0 else "SOLD"
@@ -483,7 +488,8 @@ class AlphaPulseBot(BaseBot):
 
         etf_mid = self._mid(books.get("LON_ETF"))
         if etf_mid is not None:
-            theos["LON_FLY"] = 0.8 * theos["LON_FLY"] + 0.2 * fly_payoff(etf_mid)
+            # Shift trust towards the market midpoint of the underlying ETF
+            theos["LON_FLY"] = 0.3 * theos["LON_FLY"] + 0.7 * fly_payoff(etf_mid)
 
         # If the market in an unmodeled product is tighter than our model, blend lightly with the midpoint.
         for symbol in ("TIDE_SWING", "WX_SUM"):
@@ -528,14 +534,21 @@ class AlphaPulseBot(BaseBot):
         return self._fallback_mid_or_start("WX_SUM", books)
 
     def _infer_lhr_count(self, books: dict[str, OrderBook], tide_spot: float, wx_spot: float) -> float:
+        etf_mid = self._mid(books.get("LON_ETF"))
+        market_implied = etf_mid - tide_spot - wx_spot if etf_mid is not None else None
+
         if self.aerodatabox_key:
             count = self.external_cache.get("flights", {}).get("count")
             if count is not None:
-                return max(0.0, float(count))
+                api_val = float(count)
+                if market_implied is not None:
+                    # If API differs wildly from market implied, trust market more
+                    if abs(api_val - market_implied) > 500:
+                        return 0.4 * api_val + 0.6 * market_implied
+                return api_val
 
-        etf_mid = self._mid(books.get("LON_ETF"))
-        if etf_mid is not None:
-            return max(0.0, etf_mid - tide_spot - wx_spot)
+        if market_implied is not None:
+            return max(0.0, market_implied)
 
         start = self.products.get("LHR_COUNT")
         if start:
@@ -763,12 +776,15 @@ class AlphaPulseBot(BaseBot):
             resp = requests.get(
                 f"https://environment.data.gov.uk/flood-monitoring/id/measures/{THAMES_MEASURE}/readings",
                 params={"_sorted": "", "_limit": 193},
-                timeout=10,
+                timeout=30,
             )
             resp.raise_for_status()
-            items = resp.json().get("items", [])
+            items = [i for i in resp.json().get("items", []) if i.get("value") is not None]
             if not items:
                 return self.external_cache.get("thames", {})
+
+            # Ensure data is sorted by time ascending (latest last)
+            items.sort(key=lambda x: x["dateTime"])
 
             times = [
                 datetime.fromisoformat(item["dateTime"].replace("Z", "+00:00")).astimezone(ZoneInfo("Europe/London"))
@@ -871,7 +887,7 @@ if __name__ == "__main__":
         dotenv.load_dotenv()
 
     EXCHANGE_URL = os.getenv(
-        "CMI_EXCHANGE_URL", "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
+        "CMI_EXCHANGE_URL", "http://ec2-52-19-74-159.eu-west-1.compute.amazonaws.com"
     )
     USERNAME = os.getenv("CMI_USERNAME")
     PASSWORD = os.getenv("CMI_PASSWORD")
