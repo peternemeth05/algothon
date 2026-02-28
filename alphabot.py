@@ -78,6 +78,7 @@ class AlphaPulseBot(BaseBot):
     EXTERNAL_REFRESH_SECS = 300.0
     MIN_ACTION_GAP_SECS = 1.05
     EVAL_INTERVAL_SECS = 4.0
+    THEO_SMOOTHING = 0.22
     PRODUCT_SCORE_BIAS = {
         "TIDE_SPOT": 1.0,
         "TIDE_SWING": 0.9,
@@ -110,6 +111,7 @@ class AlphaPulseBot(BaseBot):
         self.books: dict[str, OrderBook] = {}
         self.positions: dict[str, int] = {}
         self.theos: dict[str, float] = {}
+        self.smoothed_theos: dict[str, float] = {}
         self.external_cache: dict[str, Any] = {}
         self.external_updated_at = 0.0
         self.last_eval_at = 0.0
@@ -172,7 +174,8 @@ class AlphaPulseBot(BaseBot):
         if not books:
             return
 
-        self.theos = self._build_theos(books)
+        raw_theos = self._build_theos(books)
+        self.theos = self._smooth_theos(raw_theos)
         candidates = self._rank_opportunities(books, positions)
         if not candidates:
             return
@@ -292,10 +295,11 @@ class AlphaPulseBot(BaseBot):
 
         directional_imbalance = abs(signal["buy_edge"] - signal["sell_edge"])
         one_sided = directional_imbalance >= self.quote_edge
+        inventory_heavy = abs(position) >= max(2, self.max_position // 3)
 
         target_bid = bid if signal["buy_edge"] >= self.quote_edge and position < self.max_position else None
         target_ask = ask if signal["sell_edge"] >= self.quote_edge and position > -self.max_position else None
-        if not one_sided:
+        if not one_sided and not inventory_heavy:
             if target_bid is None and position < self.max_position:
                 target_bid = bid
             if target_ask is None and position > -self.max_position:
@@ -360,16 +364,30 @@ class AlphaPulseBot(BaseBot):
         spread = (best_ask - best_bid) if best_bid is not None and best_ask is not None else 8.0
 
         if symbol == "LON_FLY":
-            return max(8.0, spread / 2.0)
+            return max(10.0, spread / 2.0 + 1.5)
         if symbol in {"TIDE_SWING", "WX_SUM"}:
-            return max(6.0, spread / 2.0)
-        return max(4.0, spread / 2.0)
+            return max(7.0, spread / 2.0 + 1.0)
+        return max(5.0, spread / 2.0 + 0.5)
 
     def _size_for_position(self, position: int, edge: float = 0.0) -> int:
         utilization = abs(position) / max(self.max_position, 1)
-        scale = 1.0 - clamp(utilization, 0.0, 0.85)
-        edge_boost = 1.0 + clamp(edge / max(self.aggress_edge, 1.0), 0.0, 1.0)
-        return max(1, int(round(self.base_order_size * scale * edge_boost)))
+        scale = 1.0 - clamp(utilization, 0.0, 0.9)
+        edge_boost = 1.0 + 0.35 * clamp(edge / max(self.aggress_edge, 1.0), 0.0, 1.0)
+        raw_size = self.base_order_size * scale * edge_boost
+        return max(0, int(round(raw_size)))
+
+    def _smooth_theos(self, fresh_theos: dict[str, float]) -> dict[str, float]:
+        if not self.smoothed_theos:
+            self.smoothed_theos = dict(fresh_theos)
+            return dict(fresh_theos)
+
+        alpha = self.THEO_SMOOTHING
+        smoothed: dict[str, float] = {}
+        for symbol, fresh in fresh_theos.items():
+            previous = self.smoothed_theos.get(symbol, fresh)
+            smoothed[symbol] = previous + alpha * (fresh - previous)
+        self.smoothed_theos = smoothed
+        return dict(smoothed)
 
     def _build_theos(self, books: dict[str, OrderBook]) -> dict[str, float]:
         tide_spot = self._theo_tide_spot(books)
@@ -622,9 +640,9 @@ if __name__ == "__main__":
         USERNAME,
         PASSWORD,
         aerodatabox_key=AERODATABOX_KEY,
-        base_order_size=3,
-        max_position=15,
-        aggress_edge=14.0,
-        quote_edge=7.0,
+        base_order_size=2,
+        max_position=12,
+        aggress_edge=16.0,
+        quote_edge=8.0,
     )
     bot.run()
