@@ -149,23 +149,22 @@ class _SSEThread(Thread):
         self._closed = True
         if self._http_stream:
             self._http_stream.close()
-        if self._client:
-            self._client.close()
+        if self._client and getattr(self._client, "resp", None):
+            self._client.resp.close()
 
     def _consume(self):
         headers = {
             "Authorization": self._bearer,
             "Accept": "text/event-stream; charset=utf-8",
         }
-        self._http_stream = requests.get(
+        self._client = sseclient.SSEClient(
             _normalize_request_url(self._url),
-            stream=True,
             headers=headers,
             timeout=30,
         )
-        self._client = sseclient.SSEClient(self._http_stream)
+        self._http_stream = self._client.resp
 
-        for event in self._client.events():
+        for event in self._client:
             payload = (event.data or "").strip()
             if not payload:
                 continue
