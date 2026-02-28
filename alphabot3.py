@@ -91,6 +91,7 @@ class ProductConfig:
     max_position: int
     base_width: float
     ml_weight: float
+    size_multiplier: float
 
 
 class OnlineLinearModel:
@@ -208,23 +209,39 @@ class AlphaBot3(BaseBot):
     )
 
     PRODUCT_CONFIGS = {
-        "TIDE_SPOT": ProductConfig(11.0, 5.0, 28, 6.6, 0.35),
-        "TIDE_SWING": ProductConfig(15.0, 7.0, 16, 9.9, 0.15),
-        "WX_SPOT": ProductConfig(10.0, 4.5, 32, 5.5, 0.35),
-        "WX_SUM": ProductConfig(12.0, 5.5, 20, 7.7, 0.20),
-        "LHR_COUNT": ProductConfig(12.0, 5.0, 24, 6.6, 0.30),
-        "LHR_INDEX": ProductConfig(14.0, 6.0, 12, 8.8, 0.10),
-        "LON_ETF": ProductConfig(14.0, 6.0, 24, 8.8, 0.30),
-        "LON_FLY": ProductConfig(20.0, 9.0, 10, 13.2, 0.05),
+        "TIDE_SPOT": ProductConfig(11.0, 5.2, 26, 5.5, 0.30, 1.05),
+        "TIDE_SWING": ProductConfig(15.0, 7.0, 18, 9.0, 0.14, 0.85),
+        "WX_SPOT": ProductConfig(10.0, 4.8, 28, 4.5, 0.30, 1.05),
+        "WX_SUM": ProductConfig(12.0, 5.6, 22, 7.0, 0.18, 0.90),
+        "LHR_COUNT": ProductConfig(11.0, 4.8, 28, 5.5, 0.22, 1.00),
+        "LHR_INDEX": ProductConfig(18.0, 8.0, 8, 9.0, 0.06, 0.65),
+        "LON_ETF": ProductConfig(12.0, 5.0, 36, 7.0, 0.15, 1.50),
+        "LON_FLY": ProductConfig(18.0, 8.0, 16, 11.0, 0.03, 1.70),
     }
 
+    # When enabled, structural derived-product dislocations dominate capital allocation.
+    STRUCTURE_FIRST = True
     REFRESH_SECS = 240.0
     EVAL_SECS = 2.0
-    MIN_REST_GAP = 1.1
+    MIN_REST_GAP = 1.05
     MAX_ACTIVE_QUOTES = 2
     SETTLEMENT_GUARD_MINUTES = 8
     SETTLEMENT_GUARD_MULTIPLIER = 4.0
     SMOOTH_ALPHA = 0.28
+    TOP2_SCORE_CLOSE_RATIO = 0.93
+    HIGH_CONVICTION_EDGE = 7.0
+    STAND_DOWN_EDGE = 5.5
+    BASKET_DISLOCATION_THRESHOLD = 45.0
+    BASKET_AGGRESS_THRESHOLD = 90.0
+    FLY_DISLOCATION_THRESHOLD = 55.0
+    FLY_AGGRESS_THRESHOLD = 95.0
+    LHR_INDEX_SUPER_EDGE_MULTIPLIER = 1.35
+    DERIVED_STRENGTH_SCORE = 18.0
+    COMPARABLE_SCORE_RATIO = 0.92
+    STRUCTURE_DOMINANCE_RATIO = 0.85
+    OVERNIGHT_START_HOUR = 0
+    OVERNIGHT_END_HOUR = 5
+    LOW_UNCERTAINTY_SIGMA = 85.0
 
     def __init__(
         self,
@@ -255,6 +272,8 @@ class AlphaBot3(BaseBot):
         self.ml_models = {symbol: OnlineLinearModel(6) for symbol in self.WATCHLIST}
         self.ml_pending: dict[str, tuple[list[float], float]] = {}
         self._last_theo_log_at = 0.0
+        self.structure_state: dict[str, Any] = {}
+        self.last_priority_reason = "IDLE"
 
         self._lock = threading.Lock()
         self._eval_lock = threading.Lock()
@@ -331,24 +350,43 @@ class AlphaBot3(BaseBot):
             if signal:
                 signals.append(signal)
 
-        signals.sort(key=lambda item: item["score"], reverse=True)
+        if not signals:
+            self._cancel_all_quotes()
+            return
+
+        selected = self._select_priority_signals(signals)
+        if not selected:
+            self._cancel_all_quotes()
+            return
+
+        selected_symbols = {signal["product"] for signal in selected}
+        highest = selected[0]
+        if highest["priority_reason"] == "STRUCTURE":
+            for symbol in list(self.active_quotes.keys()):
+                if symbol not in selected_symbols:
+                    self._cancel_quote(symbol)
+        else:
+            for symbol in list(self.active_quotes.keys()):
+                if symbol not in selected_symbols:
+                    self._cancel_quote(symbol)
 
         active_targets: set[str] = set()
-        for signal in signals:
+        for signal in selected:
             symbol = signal["product"]
-            config = self.PRODUCT_CONFIGS[symbol]
             book = books[symbol]
             fair = signal["effective_fair"]
             position = positions.get(symbol, 0)
 
-            if signal["edge"] >= config.take_edge:
+            if signal["edge"] >= signal["take_threshold"]:
                 self._cancel_quote(symbol)
                 self._take_liquidity(signal, book, fair, position)
                 continue
 
-            if signal["edge"] >= config.quote_edge and len(active_targets) < self.MAX_ACTIVE_QUOTES:
+            if signal["edge"] >= signal["quote_threshold"]:
                 self._quote(signal, book, fair, position)
                 active_targets.add(symbol)
+            else:
+                self._cancel_quote(symbol)
 
         for symbol in list(self.active_quotes.keys()):
             if symbol not in active_targets:
@@ -367,6 +405,10 @@ class AlphaBot3(BaseBot):
         lhr_index = self._theo_lhr_index(books, flights)
         lon_etf = tide_spot + wx_spot + lhr_count
         lon_fly = self._theo_lon_fly(books, lon_etf)
+        etf_mid = self._mid(books.get("LON_ETF"))
+        fly_mid = self._mid(books.get("LON_FLY"))
+        basket_dislocation = None if etf_mid is None else etf_mid - lon_etf
+        fly_dislocation = None if fly_mid is None else fly_mid - lon_fly
 
         theos = {
             "TIDE_SPOT": tide_spot,
@@ -384,6 +426,15 @@ class AlphaBot3(BaseBot):
             mid = self._mid(books.get(symbol))
             if mid is not None:
                 theos[symbol] = (1.0 - weight) * theos[symbol] + weight * mid
+
+        self.structure_state = {
+            "basket_dislocation": basket_dislocation,
+            "fly_dislocation": fly_dislocation,
+            "etf_model_fair": lon_etf,
+            "fly_model_fair": lon_fly,
+            "etf_mid": etf_mid,
+            "fly_mid": fly_mid,
+        }
 
         return theos
 
@@ -437,8 +488,8 @@ class AlphaBot3(BaseBot):
         structural = 0.2 * scenario_down + 0.6 * scenario_mid + 0.2 * scenario_up
 
         market_mid = self._mid(books.get("LON_FLY"))
-        if market_mid is not None and sigma < 140.0:
-            structural = 0.9 * structural + 0.1 * market_mid
+        if market_mid is not None and sigma < self.LOW_UNCERTAINTY_SIGMA:
+            structural = 0.96 * structural + 0.04 * market_mid
         return structural
 
     def _estimate_etf_uncertainty(self) -> float:
@@ -503,7 +554,76 @@ class AlphaBot3(BaseBot):
         aligned_ml = direction * ml_adjust
         inventory_penalty = max(0.0, abs(position) / max(config.max_position, 1) - 0.35) * config.quote_edge
         confidence_boost = 0.35 + 0.65 * progress
-        score = edge * (1.0 + confidence_boost) + 0.25 * max(0.0, aligned_ml) - inventory_penalty
+        score = edge * (1.0 + confidence_boost) + 0.18 * max(0.0, aligned_ml) - inventory_penalty
+
+        take_threshold = config.take_edge
+        quote_threshold = config.quote_edge
+        size_boost = 1.0
+        priority_reason = "ML_MICRO" if abs(ml_adjust) > 2.0 else "BASE"
+
+        if symbol in {"TIDE_SWING", "WX_SUM", "LHR_COUNT", "LHR_INDEX"}:
+            late_path = 1.0 + 1.15 * progress
+            score *= late_path
+            size_boost *= 0.7 + 1.6 * progress
+            if progress > 0.7:
+                priority_reason = "LATE_PATH"
+
+        if symbol in {"TIDE_SPOT", "WX_SPOT"}:
+            snapshot_reliability = 1.0 + 0.55 * progress
+            score *= snapshot_reliability
+            size_boost *= 0.85 + 0.85 * progress
+            if progress > 0.65:
+                quote_threshold += 0.5
+                priority_reason = "SNAPSHOT_CONVERGENCE"
+
+        if symbol == "LHR_INDEX":
+            if edge < config.take_edge * self.LHR_INDEX_SUPER_EDGE_MULTIPLIER:
+                score *= 0.45
+                quote_threshold += 1.5
+                take_threshold += 2.5
+            else:
+                priority_reason = "LATE_PATH"
+
+        basket_dislocation = self.structure_state.get("basket_dislocation")
+        fly_dislocation = self.structure_state.get("fly_dislocation")
+        if symbol == "LON_ETF" and basket_dislocation is not None:
+            abs_basket = abs(basket_dislocation)
+            if abs_basket >= self.BASKET_DISLOCATION_THRESHOLD:
+                score += 0.9 * abs_basket
+                size_boost *= 1.35
+                quote_threshold = max(3.5, quote_threshold - 1.0)
+                if abs_basket >= self.BASKET_AGGRESS_THRESHOLD:
+                    take_threshold = max(5.0, take_threshold - 2.0)
+                    size_boost *= 1.25
+                priority_reason = "STRUCTURE"
+            elif self.STRUCTURE_FIRST:
+                score *= 1.08
+
+        if symbol == "LON_FLY" and fly_dislocation is not None:
+            abs_fly = abs(fly_dislocation)
+            if abs_fly < self.FLY_DISLOCATION_THRESHOLD and edge < config.take_edge:
+                return None
+            if abs_fly >= self.FLY_DISLOCATION_THRESHOLD:
+                score += 0.95 * abs_fly
+                quote_threshold = max(config.quote_edge + 0.5, quote_threshold)
+                size_boost *= 1.45
+                if abs_fly >= self.FLY_AGGRESS_THRESHOLD:
+                    take_threshold = max(8.0, take_threshold - 2.5)
+                    size_boost *= 1.35
+                priority_reason = "STRUCTURE"
+            else:
+                score *= 0.75
+
+        if symbol == "LHR_COUNT":
+            count_remaining = float(self.external_cache.get("flights", {}).get("count_remaining_weighted", 0.0))
+            market_mid = self._mid(book)
+            if self._is_overnight_lhr_window() and market_mid is not None:
+                remaining_overstatement = market_mid - structural_fair
+                if remaining_overstatement > max(18.0, 0.35 * count_remaining) and sell_edge > 0.0:
+                    score += min(30.0, 0.45 * remaining_overstatement)
+                    size_boost *= 1.25
+                    take_threshold = max(6.0, take_threshold - 1.0)
+                    priority_reason = "LATE_PATH"
 
         return {
             "product": symbol,
@@ -514,6 +634,11 @@ class AlphaBot3(BaseBot):
             "effective_fair": effective_fair,
             "progress": progress,
             "ml_adjust": ml_adjust,
+            "take_threshold": take_threshold,
+            "quote_threshold": quote_threshold,
+            "size_boost": size_boost,
+            "priority_reason": priority_reason,
+            "structural_fair": structural_fair,
         }
 
     def _ml_features(
@@ -554,6 +679,73 @@ class AlphaBot3(BaseBot):
         prediction = model.predict(features)
         return clamp(prediction, -12.0, 12.0)
 
+    def _select_priority_signals(self, signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        ranked = sorted(signals, key=lambda item: item["score"], reverse=True)
+        if not ranked:
+            return []
+
+        best = ranked[0]
+        strong_derived = max(
+            (
+                signal["score"]
+                for signal in ranked
+                if signal["product"] in {"LON_ETF", "LON_FLY"} and signal["priority_reason"] == "STRUCTURE"
+            ),
+            default=0.0,
+        )
+        if strong_derived >= self.DERIVED_STRENGTH_SCORE:
+            for signal in ranked:
+                if signal["product"] not in {"LON_ETF", "LON_FLY"} and signal["score"] < strong_derived:
+                    signal["score"] *= 0.55 if signal["edge"] < signal["take_threshold"] else 0.78
+            ranked.sort(key=lambda item: item["score"], reverse=True)
+            best = ranked[0]
+
+        if self.STRUCTURE_FIRST and best["product"] not in {"LON_ETF", "LON_FLY"}:
+            for signal in ranked[1:]:
+                if (
+                    signal["product"] in {"LON_ETF", "LON_FLY"}
+                    and signal["score"] >= best["score"] * self.COMPARABLE_SCORE_RATIO
+                ):
+                    best = signal
+                    break
+            ranked.sort(
+                key=lambda item: (
+                    0 if item["product"] == best["product"] else 1,
+                    -item["score"],
+                )
+            )
+
+        if best["edge"] < self.STAND_DOWN_EDGE:
+            self.last_priority_reason = "STAND_DOWN"
+            print(f"PRIORITY STAND_DOWN best={best['product']} edge={best['edge']:.1f}")
+            return []
+
+        chosen = [ranked[0]]
+        allow_two = (
+            best["edge"] >= self.HIGH_CONVICTION_EDGE
+            and len(ranked) > 1
+            and ranked[1]["score"] >= ranked[0]["score"] * self.TOP2_SCORE_CLOSE_RATIO
+            and ranked[1]["edge"] >= self.HIGH_CONVICTION_EDGE
+        )
+        if allow_two:
+            chosen.append(ranked[1])
+
+        if best["priority_reason"] == "STRUCTURE":
+            chosen = [best] + [
+                signal
+                for signal in chosen[1:]
+                if signal["product"] in {"LON_ETF", "LON_FLY"}
+                or signal["score"] >= best["score"] * self.STRUCTURE_DOMINANCE_RATIO
+            ]
+
+        self.last_priority_reason = best["priority_reason"]
+        selected_text = ", ".join(
+            f"{signal['product']}({signal['score']:.1f},{signal['priority_reason']})"
+            for signal in chosen
+        )
+        print(f"PRIORITY {best['priority_reason']} selected={selected_text}")
+        return chosen
+
     def _take_liquidity(
         self,
         signal: dict[str, Any],
@@ -566,20 +758,20 @@ class AlphaBot3(BaseBot):
         best_ask_order = self._best_ask_order(book)
         best_bid_order = self._best_bid_order(book)
 
-        if best_ask_order and signal["buy_edge"] >= config.take_edge and position < config.max_position:
+        if best_ask_order and signal["buy_edge"] >= signal["take_threshold"] and position < config.max_position:
             available = best_ask_order.volume - best_ask_order.own_volume
-            size = min(self._size_for(symbol, position, signal["edge"]), available, config.max_position - position)
+            size = min(self._size_for(symbol, position, signal), available, config.max_position - position)
             if size > 0:
                 self._send_ioc(OrderRequest(symbol, best_ask_order.price, Side.BUY, size))
-                print(f"HIT BUY  {size} {symbol} @ {best_ask_order.price:.0f}  theo={fair:.1f}")
+                print(f"HIT BUY  {size} {symbol} @ {best_ask_order.price:.0f}  theo={fair:.1f}  why={signal['priority_reason']}")
                 return
 
-        if best_bid_order and signal["sell_edge"] >= config.take_edge and position > -config.max_position:
+        if best_bid_order and signal["sell_edge"] >= signal["take_threshold"] and position > -config.max_position:
             available = best_bid_order.volume - best_bid_order.own_volume
-            size = min(self._size_for(symbol, position, signal["edge"]), available, config.max_position + position)
+            size = min(self._size_for(symbol, position, signal), available, config.max_position + position)
             if size > 0:
                 self._send_ioc(OrderRequest(symbol, best_bid_order.price, Side.SELL, size))
-                print(f"HIT SELL {size} {symbol} @ {best_bid_order.price:.0f}  theo={fair:.1f}")
+                print(f"HIT SELL {size} {symbol} @ {best_bid_order.price:.0f}  theo={fair:.1f}  why={signal['priority_reason']}")
 
     def _quote(
         self,
@@ -597,7 +789,7 @@ class AlphaBot3(BaseBot):
         tick = product.tickSize or 1.0
         best_bid = self._best_bid(book)
         best_ask = self._best_ask(book)
-        size = self._size_for(symbol, position, signal["edge"])
+        size = self._size_for(symbol, position, signal)
         if size <= 0:
             self._cancel_quote(symbol)
             return
@@ -610,6 +802,12 @@ class AlphaBot3(BaseBot):
         # Path products can quote tighter as more of their value is realized.
         progress = signal["progress"]
         half_width *= 1.15 - 0.25 * progress
+        if symbol in {"TIDE_SPOT", "WX_SPOT"}:
+            half_width *= 1.10 - 0.40 * progress
+        if symbol == "LON_ETF" and signal["priority_reason"] == "STRUCTURE":
+            half_width *= 0.75
+        if symbol == "LON_FLY" and signal["priority_reason"] == "STRUCTURE":
+            half_width *= 0.80
 
         # Inventory skewing: aggressively move prices to encourage
         # the market to trade us back toward a neutral position.
@@ -629,11 +827,8 @@ class AlphaBot3(BaseBot):
         if bid_price <= 0 or ask_price <= bid_price:
             return
 
-        # Always allow the inventory-reducing side to quote, even at position limits.
-        can_bid = position < config.max_position
-        can_ask = position > -config.max_position
-        target_bid = bid_price if signal["buy_edge"] >= config.quote_edge and can_bid else None
-        target_ask = ask_price if signal["sell_edge"] >= config.quote_edge and can_ask else None
+        target_bid = bid_price if signal["buy_edge"] >= config.quote_edge and position < config.max_position else None
+        target_ask = ask_price if signal["sell_edge"] >= config.quote_edge and position > -config.max_position else None
         if target_bid is None and target_ask is None:
             self._cancel_quote(symbol)
             return
@@ -661,7 +856,7 @@ class AlphaBot3(BaseBot):
             bid_price=target_bid if bid_response else None,
             ask_price=target_ask if ask_response else None,
         )
-        print(f"QUOTE {symbol:>10}  {target_bid or '-'} / {target_ask or '-'}  theo={fair:.1f}")
+        print(f"QUOTE {symbol:>10}  {target_bid or '-'} / {target_ask or '-'}  theo={fair:.1f}  why={signal['priority_reason']}")
 
     def _cancel_quote(self, symbol: str) -> None:
         quote = self.active_quotes.pop(symbol, None)
@@ -683,13 +878,22 @@ class AlphaBot3(BaseBot):
             self.last_rest_at = time.monotonic()
         return response
 
-    def _size_for(self, symbol: str, position: int, edge: float) -> int:
+    def _size_for(self, symbol: str, position: int, signal: dict[str, Any]) -> int:
         config = self.PRODUCT_CONFIGS[symbol]
+        edge = signal["edge"]
         utilization = abs(position) / max(config.max_position, 1)
         scale = 1.0 - clamp(utilization, 0.0, 0.85)
         edge_boost = 1.0 + 0.30 * clamp(edge / max(config.take_edge, 1.0), 0.0, 1.5)
-        path_bias = 1.0 + 0.20 * self._progress_for(symbol)
-        raw = self.base_order_size * scale * edge_boost * path_bias
+        progress = signal["progress"]
+        if symbol in {"TIDE_SWING", "WX_SUM", "LHR_COUNT", "LHR_INDEX"}:
+            timing_bias = 0.55 + 1.55 * progress
+        else:
+            timing_bias = 0.85 + 1.00 * progress
+        if symbol == "LON_ETF" and signal["priority_reason"] == "STRUCTURE":
+            timing_bias *= 1.25
+        if symbol == "LON_FLY" and signal["priority_reason"] == "STRUCTURE":
+            timing_bias *= 1.35
+        raw = self.base_order_size * config.size_multiplier * scale * edge_boost * timing_bias * signal.get("size_boost", 1.0)
         return max(0, int(round(raw)))
 
     def _smooth_theos(self, fresh: dict[str, float]) -> dict[str, float]:
@@ -714,6 +918,7 @@ class AlphaBot3(BaseBot):
         if self.aerodatabox_key:
             self.external_cache["flights"] = self._fetch_flights()
         self.last_refresh_at = now_monotonic
+        self._log_refresh_decomposition()
         print("External data refresh complete.")
 
     def _fetch_weather(self) -> dict[str, Any]:
@@ -1015,6 +1220,10 @@ class AlphaBot3(BaseBot):
             return self._progress_for("LON_ETF")
         return default
 
+    def _is_overnight_lhr_window(self) -> bool:
+        now_london = datetime.now(LONDON_TZ)
+        return self.OVERNIGHT_START_HOUR <= now_london.hour <= self.OVERNIGHT_END_HOUR
+
     def _minutes_to_settlement(self) -> float:
         settle = self._next_settlement_time()
         now_london = datetime.now(LONDON_TZ)
@@ -1076,7 +1285,39 @@ class AlphaBot3(BaseBot):
             return
         self._last_theo_log_at = now_monotonic
         formatted = "  ".join(f"{symbol}={value:.0f}" for symbol, value in self.theos.items())
-        print(f"THEOS  {formatted}")
+        basket = self.structure_state.get("basket_dislocation")
+        fly = self.structure_state.get("fly_dislocation")
+        extras: list[str] = []
+        if basket is not None:
+            extras.append(f"basket={basket:+.1f}")
+        if fly is not None:
+            extras.append(f"fly={fly:+.1f}")
+        suffix = "" if not extras else "  " + "  ".join(extras)
+        print(f"THEOS  {formatted}{suffix}")
+
+    def _log_refresh_decomposition(self) -> None:
+        weather = self.external_cache.get("weather", {})
+        tide = self.external_cache.get("thames", {})
+        flights = self.external_cache.get("flights", {})
+
+        if weather:
+            print(
+                "WX_PATH "
+                f"realized={float(weather.get('wx_sum_realized', 0.0)):.1f} "
+                f"remaining={float(weather.get('wx_sum_remaining', 0.0)):.1f}"
+            )
+        if tide:
+            print(
+                "TIDE_PATH "
+                f"realized={float(tide.get('swing_realized', 0.0)):.1f} "
+                f"remaining={float(tide.get('swing_remaining', 0.0)):.1f}"
+            )
+        if flights:
+            print(
+                "LHR_PATH "
+                f"count={float(flights.get('count_realized', 0.0)):.1f}+{float(flights.get('count_remaining_weighted', 0.0)):.1f} "
+                f"index={float(flights.get('index_realized_raw', 0.0)):.1f}+{float(flights.get('index_projected_raw', 0.0)):.1f}"
+            )
 
     def _next_settlement_time(self) -> datetime:
         now_london = datetime.now(LONDON_TZ)
