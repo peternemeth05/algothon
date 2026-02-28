@@ -138,7 +138,7 @@ class _SSEThread(Thread):
         while not self._closed:
             try:
                 self._consume()
-            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError):
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError, TimeoutError):
                 pass
             except Exception:
                 if not self._closed:
@@ -149,28 +149,34 @@ class _SSEThread(Thread):
         self._closed = True
         if self._http_stream:
             self._http_stream.close()
-        if self._client:
-            self._client.close()
+        if self._client and getattr(self._client, "resp", None):
+            self._client.resp.close()
 
     def _consume(self):
         headers = {
             "Authorization": self._bearer,
             "Accept": "text/event-stream; charset=utf-8",
         }
-        self._http_stream = requests.get(
+        self._client = sseclient.SSEClient(
             _normalize_request_url(self._url),
-            stream=True,
             headers=headers,
             timeout=30,
         )
-        self._client = sseclient.SSEClient(self._http_stream)
+        self._http_stream = self._client.resp
 
-        for event in self._client.events():
+        for event in self._client:
+            payload = (event.data or "").strip()
+            if not payload:
+                continue
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+
             if event.event == "order":
-                self._on_order_event(json.loads(event.data))
+                self._on_order_event(parsed)
             elif event.event == "trade":
-                data = json.loads(event.data)
-                trades = data if isinstance(data, list) else [data]
+                trades = parsed if isinstance(parsed, list) else [parsed]
                 trade_fields = {f.name for f in Trade.__dataclass_fields__.values()}
                 for t in trades:
                     self._handle_trade_event(Trade(**{k: v for k, v in t.items() if k in trade_fields}))
