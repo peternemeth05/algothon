@@ -810,16 +810,14 @@ class AlphaPulseBot(BaseBot):
                     settle - timedelta(hours=24),
                     settle,
                 )
-            swing_sum = 0.0
-            window_start = settle - timedelta(hours=48)
-            window_end = settle - timedelta(hours=24)
-            for prev_t, curr_t, prev, curr in zip(
-                times, times[1:], levels, levels[1:]
-            ):
-                if prev_t < window_start or curr_t > window_end:
-                    continue
-                diff_cm = abs(curr - prev) * 100.0
-                swing_sum += max(0.0, 20.0 - diff_cm) + max(0.0, diff_cm - 25.0)
+                swing_sum = 0.0
+                window_start = settle - timedelta(hours=24)
+                window_end = settle
+                for prev_t, curr_t, prev, curr in zip(
+                    times, times[1:], levels, levels[1:]
+                ):
+                    if prev_t < window_start or curr_t > window_end:
+                        continue
 
             snapshot = {
                 "latest_level_m": latest_level,
