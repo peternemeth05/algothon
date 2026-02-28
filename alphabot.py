@@ -78,13 +78,17 @@ class AlphaPulseBot(BaseBot):
     EXTERNAL_REFRESH_SECS = 300.0
     MIN_ACTION_GAP_SECS = 1.05
     EVAL_INTERVAL_SECS = 4.0
+    THEO_SMOOTHING = 0.22
     PRODUCT_SCORE_BIAS = {
         "TIDE_SPOT": 1.0,
         "TIDE_SWING": 0.9,
         "WX_SPOT": 1.0,
         "WX_SUM": 0.9,
         "LON_ETF": 1.2,
-        "LON_FLY": 1.35,
+        "LON_FLY": 0.9,
+    }
+    PRODUCT_MAX_POSITION = {
+        "LON_FLY": 6,
     }
 
     def __init__(
@@ -110,6 +114,7 @@ class AlphaPulseBot(BaseBot):
         self.books: dict[str, OrderBook] = {}
         self.positions: dict[str, int] = {}
         self.theos: dict[str, float] = {}
+        self.smoothed_theos: dict[str, float] = {}
         self.external_cache: dict[str, Any] = {}
         self.external_updated_at = 0.0
         self.last_eval_at = 0.0
@@ -172,7 +177,8 @@ class AlphaPulseBot(BaseBot):
         if not books:
             return
 
-        self.theos = self._build_theos(books)
+        raw_theos = self._build_theos(books)
+        self.theos = self._smooth_theos(raw_theos)
         candidates = self._rank_opportunities(books, positions)
         if not candidates:
             return
@@ -203,7 +209,7 @@ class AlphaPulseBot(BaseBot):
         for symbol in self.WATCHLIST:
             if symbol not in books or symbol not in self.theos:
                 continue
-            signal = self._signal_for(symbol, books[symbol], self.theos[symbol], positions.get(symbol, 0))
+            signal = self._signal_for(symbol, books[symbol], self.theos[symbol], positions.get(symbol, 0), positions)
             if signal:
                 ranked.append(signal)
         ranked.sort(key=lambda item: item["score"], reverse=True)
@@ -215,18 +221,21 @@ class AlphaPulseBot(BaseBot):
         book: OrderBook,
         fair: float,
         position: int,
+        positions: dict[str, int],
     ) -> dict[str, Any] | None:
         best_bid = self._best_market_bid(book)
         best_ask = self._best_market_ask(book)
         if best_bid is None and best_ask is None:
             return None
 
-        if best_ask is not None and position < self.max_position:
+        position_limit = self._position_limit(symbol)
+
+        if best_ask is not None and position < position_limit:
             buy_edge = fair - best_ask
         else:
             buy_edge = float("-inf")
 
-        if best_bid is not None and position > -self.max_position:
+        if best_bid is not None and position > -position_limit:
             sell_edge = best_bid - fair
         else:
             sell_edge = float("-inf")
@@ -236,7 +245,8 @@ class AlphaPulseBot(BaseBot):
             return None
 
         structural_bonus = self._structural_bonus(symbol, fair)
-        score = (edge + structural_bonus) * self.PRODUCT_SCORE_BIAS.get(symbol, 1.0)
+        exposure_penalty = self._exposure_penalty(symbol, position, positions)
+        score = max(0.0, (edge + structural_bonus - exposure_penalty) * self.PRODUCT_SCORE_BIAS.get(symbol, 1.0))
 
         return {
             "product": symbol,
@@ -251,16 +261,17 @@ class AlphaPulseBot(BaseBot):
         symbol = signal["product"]
         best_bid = self._best_market_bid(book)
         best_ask = self._best_market_ask(book)
-        size = self._size_for_position(position, signal["edge"])
+        position_limit = self._position_limit(symbol)
+        size = self._size_for_position(symbol, position, signal["edge"])
         if size <= 0:
             return
 
-        if best_ask is not None and signal["buy_edge"] >= self.aggress_edge and position < self.max_position:
+        if best_ask is not None and signal["buy_edge"] >= self.aggress_edge and position < position_limit:
             self._send_ioc(OrderRequest(symbol, best_ask, Side.BUY, size))
             print(f"HIT BUY  {size} {symbol} @ {best_ask:.0f}  theo={fair:.1f}")
             return
 
-        if best_bid is not None and signal["sell_edge"] >= self.aggress_edge and position > -self.max_position:
+        if best_bid is not None and signal["sell_edge"] >= self.aggress_edge and position > -position_limit:
             self._send_ioc(OrderRequest(symbol, best_bid, Side.SELL, size))
             print(f"HIT SELL {size} {symbol} @ {best_bid:.0f}  theo={fair:.1f}")
 
@@ -273,12 +284,13 @@ class AlphaPulseBot(BaseBot):
         best_bid = self._best_market_bid(book)
         best_ask = self._best_market_ask(book)
         tick = product.tickSize or 1.0
-        size = self._size_for_position(position, signal["edge"])
+        position_limit = self._position_limit(symbol)
+        size = self._size_for_position(symbol, position, signal["edge"])
         if size <= 0:
             self._cancel_active_quote()
             return
 
-        inventory_skew = clamp(position / max(self.max_position, 1), -1.0, 1.0) * 5.0
+        inventory_skew = clamp(position / max(position_limit, 1), -1.0, 1.0) * 5.0
         half_width = self._dynamic_width(symbol, book, fair)
         bid = math.floor((fair - half_width - inventory_skew) / tick) * tick
         ask = math.ceil((fair + half_width - inventory_skew) / tick) * tick
@@ -292,13 +304,14 @@ class AlphaPulseBot(BaseBot):
 
         directional_imbalance = abs(signal["buy_edge"] - signal["sell_edge"])
         one_sided = directional_imbalance >= self.quote_edge
+        inventory_heavy = abs(position) >= max(2, position_limit // 3)
 
-        target_bid = bid if signal["buy_edge"] >= self.quote_edge and position < self.max_position else None
-        target_ask = ask if signal["sell_edge"] >= self.quote_edge and position > -self.max_position else None
-        if not one_sided:
-            if target_bid is None and position < self.max_position:
+        target_bid = bid if signal["buy_edge"] >= self.quote_edge and position < position_limit else None
+        target_ask = ask if signal["sell_edge"] >= self.quote_edge and position > -position_limit else None
+        if not one_sided and not inventory_heavy:
+            if target_bid is None and position < position_limit:
                 target_bid = bid
-            if target_ask is None and position > -self.max_position:
+            if target_ask is None and position > -position_limit:
                 target_ask = ask
 
         if target_bid is None and target_ask is None:
@@ -360,16 +373,50 @@ class AlphaPulseBot(BaseBot):
         spread = (best_ask - best_bid) if best_bid is not None and best_ask is not None else 8.0
 
         if symbol == "LON_FLY":
-            return max(8.0, spread / 2.0)
+            return max(10.0, spread / 2.0 + 1.5)
         if symbol in {"TIDE_SWING", "WX_SUM"}:
-            return max(6.0, spread / 2.0)
-        return max(4.0, spread / 2.0)
+            return max(7.0, spread / 2.0 + 1.0)
+        return max(5.0, spread / 2.0 + 0.5)
 
-    def _size_for_position(self, position: int, edge: float = 0.0) -> int:
-        utilization = abs(position) / max(self.max_position, 1)
-        scale = 1.0 - clamp(utilization, 0.0, 0.85)
-        edge_boost = 1.0 + clamp(edge / max(self.aggress_edge, 1.0), 0.0, 1.0)
-        return max(1, int(round(self.base_order_size * scale * edge_boost)))
+    def _size_for_position(self, symbol: str, position: int, edge: float = 0.0) -> int:
+        position_limit = self._position_limit(symbol)
+        utilization = abs(position) / max(position_limit, 1)
+        scale = 1.0 - clamp(utilization, 0.0, 0.9)
+        edge_boost = 1.0 + 0.35 * clamp(edge / max(self.aggress_edge, 1.0), 0.0, 1.0)
+        symbol_scale = 0.6 if symbol == "LON_FLY" else 1.0
+        raw_size = self.base_order_size * scale * edge_boost * symbol_scale
+        return max(0, int(round(raw_size)))
+
+    def _position_limit(self, symbol: str) -> int:
+        return self.PRODUCT_MAX_POSITION.get(symbol, self.max_position)
+
+    def _exposure_penalty(self, symbol: str, position: int, positions: dict[str, int]) -> float:
+        total_abs_inventory = sum(abs(qty) for qty in positions.values())
+        if total_abs_inventory <= 0:
+            return 0.0
+
+        position_limit = self._position_limit(symbol)
+        utilization = abs(position) / max(position_limit, 1)
+        concentration = abs(position) / total_abs_inventory
+        penalty = max(0.0, utilization - 0.4) * self.quote_edge
+
+        if symbol == "LON_FLY":
+            penalty += max(0.0, concentration - 0.25) * self.aggress_edge
+
+        return penalty
+
+    def _smooth_theos(self, fresh_theos: dict[str, float]) -> dict[str, float]:
+        if not self.smoothed_theos:
+            self.smoothed_theos = dict(fresh_theos)
+            return dict(fresh_theos)
+
+        alpha = self.THEO_SMOOTHING
+        smoothed: dict[str, float] = {}
+        for symbol, fresh in fresh_theos.items():
+            previous = self.smoothed_theos.get(symbol, fresh)
+            smoothed[symbol] = previous + alpha * (fresh - previous)
+        self.smoothed_theos = smoothed
+        return dict(smoothed)
 
     def _build_theos(self, books: dict[str, OrderBook]) -> dict[str, float]:
         tide_spot = self._theo_tide_spot(books)
@@ -477,7 +524,7 @@ class AlphaPulseBot(BaseBot):
         if etf_mid is None:
             return 0.0
         synthetic = fly_payoff(etf_mid)
-        return abs(fair - synthetic) * 0.25
+        return abs(fair - synthetic) * 0.08
 
     def _refresh_external_data(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -611,8 +658,6 @@ class AlphaPulseBot(BaseBot):
         if label:
             pass
         return result
-
-
 if __name__ == "__main__":
     EXCHANGE_URL = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
     USERNAME = "out of our depth"
@@ -624,9 +669,9 @@ if __name__ == "__main__":
         USERNAME,
         PASSWORD,
         aerodatabox_key=AERODATABOX_KEY,
-        base_order_size=3,
-        max_position=15,
-        aggress_edge=14.0,
-        quote_edge=7.0,
+        base_order_size=2,
+        max_position=12,
+        aggress_edge=16.0,
+        quote_edge=8.0,
     )
     bot.run()
