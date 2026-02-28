@@ -72,9 +72,9 @@ class AlphaPulseBot1(BaseBot):
     REFRESH_SECS = 300.0
     EVAL_SECS = 3.0
     MIN_REST_GAP = 1.05
-    TAKE_EDGE = 14.0
-    QUOTE_EDGE = 7.0
-    SMOOTH_ALPHA = 0.25
+    TAKE_EDGE = 11.0
+    QUOTE_EDGE = 5.5
+    SMOOTH_ALPHA = 0.45
 
     def __init__(
         self,
@@ -83,8 +83,8 @@ class AlphaPulseBot1(BaseBot):
         password: str,
         *,
         aerodatabox_key: str | None = None,
-        base_order_size: int = 2,
-        max_position: int = 12,
+        base_order_size: int = 3,
+        max_position: int = 18,
     ):
         super().__init__(cmi_url, username, password)
         self.aerodatabox_key = aerodatabox_key
@@ -426,8 +426,8 @@ class AlphaPulseBot1(BaseBot):
 
     def _size_for(self, position: int, edge: float) -> int:
         utilization = abs(position) / max(self.max_position, 1)
-        scale = 1.0 - clamp(utilization, 0.0, 0.85)
-        edge_boost = 1.0 + 0.25 * clamp(edge / max(self.TAKE_EDGE, 1.0), 0.0, 1.0)
+        scale = 1.0 - clamp(utilization, 0.0, 0.7)
+        edge_boost = 1.0 + 0.45 * clamp(edge / max(self.TAKE_EDGE, 1.0), 0.0, 1.2)
         return max(0, int(round(self.base_order_size * scale * edge_boost)))
 
     def _refresh_external(self, force: bool = False) -> None:
@@ -497,7 +497,7 @@ class AlphaPulseBot1(BaseBot):
             response = requests.get(
                 f"https://environment.data.gov.uk/flood-monitoring/id/measures/{THAMES_MEASURE}/readings",
                 params={"_sorted": "", "_limit": 193},
-                timeout=10,
+                timeout=20,
             )
             response.raise_for_status()
             items = response.json().get("items", [])
@@ -538,8 +538,22 @@ class AlphaPulseBot1(BaseBot):
             if projected_swing is not None:
                 result["projected_swing_sum"] = projected_swing
             return result
+        except requests.exceptions.Timeout as exc:
+            print(f"Warning: Thames fetch failed: request timed out after 20s ({exc})")
+            return self.external_cache.get("thames", {})
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            reason = exc.response.reason if exc.response is not None else "unknown"
+            print(f"Warning: Thames fetch failed: HTTP {status} {reason}")
+            return self.external_cache.get("thames", {})
+        except requests.exceptions.RequestException as exc:
+            print(f"Warning: Thames fetch failed: network error ({exc.__class__.__name__}: {exc})")
+            return self.external_cache.get("thames", {})
+        except (KeyError, TypeError, ValueError) as exc:
+            print(f"Warning: Thames fetch failed: invalid response payload ({exc.__class__.__name__}: {exc})")
+            return self.external_cache.get("thames", {})
         except Exception as exc:
-            print(f"Warning: Thames fetch failed: {exc}")
+            print(f"Warning: Thames fetch failed: unexpected error ({exc.__class__.__name__}: {exc})")
             return self.external_cache.get("thames", {})
 
     def _fetch_flights(self) -> dict[str, float]:
@@ -688,7 +702,7 @@ if __name__ == "__main__":
         USERNAME,
         PASSWORD,
         aerodatabox_key=AERODATABOX_KEY,
-        base_order_size=2,
-        max_position=12,
+        base_order_size=3,
+        max_position=18,
     )
     bot.run()
