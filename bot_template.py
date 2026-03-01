@@ -191,12 +191,11 @@ class _SSEThread(Thread):
                         self._handle_trade_event(Trade(**filtered))
 
     def _looks_like_orderbook(self, payload: Any) -> bool:
-        return (
-            isinstance(payload, dict)
-            and "productsymbol" in payload
-            and "buyOrders" in payload
-            and "sellOrders" in payload
-        )
+        if not isinstance(payload, dict):
+            return False
+        if {"productsymbol", "buyOrders", "sellOrders"} <= payload.keys():
+            return True
+        return {"product", "buy", "sell"} <= payload.keys()
 
     def _looks_like_trade_payload(self, payload: Any) -> bool:
         if isinstance(payload, list):
@@ -207,21 +206,50 @@ class _SSEThread(Thread):
         return isinstance(payload, dict) and "product" in payload and "price" in payload and "volume" in payload
 
     def _on_order_event(self, data: dict[str, Any]):
-        buy_orders = sorted(
-            [
-                Order(price=float(price), volume=v["marketVolume"], own_volume=v["userVolume"])
-                for price, v in data["buyOrders"].items()
-            ],
-            key=lambda o: -o.price,
-        )
-        sell_orders = sorted(
-            [
-                Order(price=float(price), volume=v["marketVolume"], own_volume=v["userVolume"])
-                for price, v in data["sellOrders"].items()
-            ],
-            key=lambda o: o.price,
-        )
-        self._handle_orderbook(OrderBook(data["productsymbol"], data["tickSize"], buy_orders, sell_orders))
+        if {"productsymbol", "buyOrders", "sellOrders"} <= data.keys():
+            buy_orders = sorted(
+                [
+                    Order(price=float(price), volume=v["marketVolume"], own_volume=v["userVolume"])
+                    for price, v in data["buyOrders"].items()
+                ],
+                key=lambda o: -o.price,
+            )
+            sell_orders = sorted(
+                [
+                    Order(price=float(price), volume=v["marketVolume"], own_volume=v["userVolume"])
+                    for price, v in data["sellOrders"].items()
+                ],
+                key=lambda o: o.price,
+            )
+            product = data["productsymbol"]
+            tick_size = data["tickSize"]
+        else:
+            buy_orders = sorted(
+                [
+                    Order(
+                        price=float(entry["price"]),
+                        volume=int(entry["volume"]),
+                        own_volume=int(entry.get("userOrderVolume", entry.get("ownVolume", 0))),
+                    )
+                    for entry in data.get("buy", [])
+                ],
+                key=lambda o: -o.price,
+            )
+            sell_orders = sorted(
+                [
+                    Order(
+                        price=float(entry["price"]),
+                        volume=int(entry["volume"]),
+                        own_volume=int(entry.get("userOrderVolume", entry.get("ownVolume", 0))),
+                    )
+                    for entry in data.get("sell", [])
+                ],
+                key=lambda o: o.price,
+            )
+            product = data["product"]
+            tick_size = data["tickSize"]
+
+        self._handle_orderbook(OrderBook(product, tick_size, buy_orders, sell_orders))
 
 
 class BaseBot(ABC):

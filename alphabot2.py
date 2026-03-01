@@ -281,6 +281,7 @@ class AlphaBot2(BaseBot):
         self.last_refresh_at = 0.0
         self.last_eval_at = 0.0
         self.last_rest_at = 0.0
+        self.last_book_poll_at = 0.0
         self.flight_backoff_until = 0.0
         self.flight_backoff_seconds = max(self.REFRESH_SECS * 2.0, 600.0)
 
@@ -354,6 +355,11 @@ class AlphaBot2(BaseBot):
         with self._lock:
             books = dict(self.books)
             positions = dict(self.positions)
+
+        if not books:
+            books = self._poll_books_if_stale()
+            with self._lock:
+                positions = dict(self.positions)
 
         if not books:
             return
@@ -761,6 +767,29 @@ class AlphaBot2(BaseBot):
             if order.volume > order.own_volume:
                 return order
         return None
+
+    def _poll_books_if_stale(self) -> dict[str, OrderBook]:
+        now = time.monotonic()
+        if now - self.last_book_poll_at < 5.0:
+            with self._lock:
+                return dict(self.books)
+
+        polled: dict[str, OrderBook] = {}
+        for symbol in self.WATCHLIST:
+            try:
+                book = self._paced(lambda sym=symbol: self.get_orderbook(sym))
+            except Exception as exc:
+                print(f"Book poll failed for {symbol}: {exc}")
+                continue
+            polled[symbol] = book
+
+        self.last_book_poll_at = now
+        if polled:
+            with self._lock:
+                self.books.update(polled)
+                return dict(self.books)
+        with self._lock:
+            return dict(self.books)
 
     # ------------------------------------------------------------------
     # External data refresh
