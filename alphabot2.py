@@ -246,6 +246,7 @@ class AlphaBot2(BaseBot):
     SMOOTH_ALPHA = 0.40        # EMA blending for theo smoothing
     MAX_SIMULTANEOUS_QUOTES = 3
     ETF_ARB_TAKE_EDGE = 18.0   # Package edge required to short rich ETF vs buy cheap constituents
+    FLY_ARB_TAKE_EDGE = 20.0   # Package edge required to trade rich/cheap FLY vs structural value
 
     # Settlement guard: last 10 minutes before settlement
     SETTLEMENT_GUARD_MINUTES = 10
@@ -373,17 +374,16 @@ class AlphaBot2(BaseBot):
         theo_str = "  ".join(f"{s}={v:.0f}" for s, v in self.theos.items())
         print(f"THEOS  {theo_str}")
 
-        etf_overprice_arb = self._best_lon_etf_overprice_arb(books, positions)
-        if etf_overprice_arb:
+        best_arb = self._best_structural_arb(books, positions)
+        if best_arb:
             print(
-                "ARBCHK "
-                f"etf_bid={etf_overprice_arb['etf_price']:.0f} "
-                f"basket_ask={etf_overprice_arb['basket_cost']:.0f} "
-                f"edge={etf_overprice_arb['edge']:.1f} "
-                f"size={etf_overprice_arb['size']}"
+                f"ARBCHK {best_arb['label']} "
+                f"edge={best_arb['edge']:.1f} "
+                f"size={best_arb['size']} "
+                f"detail={best_arb['detail']}"
             )
-            if etf_overprice_arb["edge"] >= self.ETF_ARB_TAKE_EDGE:
-                if self._execute_lon_etf_overprice_arb(etf_overprice_arb):
+            if best_arb["edge"] >= best_arb["threshold"]:
+                if self._execute_structural_arb(best_arb):
                     return
 
         # Rank opportunities across all 8 products
@@ -598,6 +598,30 @@ class AlphaBot2(BaseBot):
                 self._send_ioc(OrderRequest(symbol, best_bid_order.price, Side.SELL, size))
                 print(f"HIT SELL {size} {symbol} @ {best_bid_order.price:.0f}  theo={fair:.1f}")
 
+    def _best_structural_arb(
+        self,
+        books: dict[str, OrderBook],
+        positions: dict[str, int],
+    ) -> dict[str, Any] | None:
+        candidates = [
+            self._best_lon_etf_overprice_arb(books, positions),
+            self._best_lon_etf_underprice_arb(books, positions),
+            self._best_lon_fly_arb(books, positions),
+        ]
+        viable = [candidate for candidate in candidates if candidate and candidate["edge"] > 0.0 and candidate["size"] > 0]
+        if not viable:
+            return None
+        return max(
+            viable,
+            key=lambda candidate: (candidate["edge"] / max(candidate["threshold"], 1.0), candidate["edge"]),
+        )
+
+    def _execute_structural_arb(self, arb: dict[str, Any]) -> bool:
+        handler = arb.get("executor")
+        if not callable(handler):
+            return False
+        return bool(handler(arb))
+
     def _best_lon_etf_overprice_arb(
         self,
         books: dict[str, OrderBook],
@@ -642,22 +666,19 @@ class AlphaBot2(BaseBot):
         if edge <= 0.0 or max_size <= 0:
             return None
 
-        size_cap = max(
-            1,
-            int(
-                round(
-                    self.base_order_size
-                    * (1.4 + 0.25 * clamp(edge / max(self.ETF_ARB_TAKE_EDGE, 1.0), 0.0, 3.0))
-                )
-            ),
-        )
+        size_cap = self._arb_size_cap(edge, self.ETF_ARB_TAKE_EDGE)
 
         return {
+            "label": "SELL_ETF_BUY_BASKET",
+            "kind": "etf_overprice",
             "edge": edge,
             "size": min(max_size, size_cap),
             "etf_price": etf_bid.price,
             "basket_cost": basket_cost,
             "legs": legs,
+            "threshold": self.ETF_ARB_TAKE_EDGE,
+            "detail": f"etf_bid={etf_bid.price:.0f},basket_ask={basket_cost:.0f}",
+            "executor": self._execute_lon_etf_overprice_arb,
         }
 
     def _execute_lon_etf_overprice_arb(self, arb: dict[str, Any]) -> bool:
@@ -694,6 +715,175 @@ class AlphaBot2(BaseBot):
             else:
                 print(f"ARB HEDGE BUY {filled} {leg['symbol']} @ {leg['price']:.0f}")
 
+        return True
+
+    def _best_lon_etf_underprice_arb(
+        self,
+        books: dict[str, OrderBook],
+        positions: dict[str, int],
+    ) -> dict[str, Any] | None:
+        etf_book = books.get("LON_ETF")
+        if not etf_book:
+            return None
+
+        etf_ask = self._best_ask_order(etf_book)
+        if not etf_ask:
+            return None
+
+        leg_symbols = ("TIDE_SPOT", "WX_SPOT", "LHR_COUNT")
+        legs: list[dict[str, Any]] = []
+        basket_proceeds = 0.0
+
+        etf_headroom = self._headroom_for_side("LON_ETF", Side.BUY, positions)
+        etf_available = max(0, etf_ask.volume - etf_ask.own_volume)
+        max_size = min(etf_headroom, etf_available)
+        if max_size <= 0:
+            return None
+
+        for symbol in leg_symbols:
+            book = books.get(symbol)
+            bid_order = self._best_bid_order(book) if book else None
+            if not bid_order:
+                return None
+
+            available = max(0, bid_order.volume - bid_order.own_volume)
+            headroom = self._headroom_for_side(symbol, Side.SELL, positions)
+            leg_cap = min(available, headroom)
+            if leg_cap <= 0:
+                return None
+
+            max_size = min(max_size, leg_cap)
+            basket_proceeds += bid_order.price
+            legs.append({"symbol": symbol, "price": bid_order.price, "side": Side.SELL})
+
+        edge = basket_proceeds - etf_ask.price
+        if edge <= 0.0 or max_size <= 0:
+            return None
+
+        size_cap = self._arb_size_cap(edge, self.ETF_ARB_TAKE_EDGE)
+
+        return {
+            "label": "BUY_ETF_SELL_BASKET",
+            "kind": "etf_underprice",
+            "edge": edge,
+            "size": min(max_size, size_cap),
+            "etf_price": etf_ask.price,
+            "basket_proceeds": basket_proceeds,
+            "legs": legs,
+            "threshold": self.ETF_ARB_TAKE_EDGE,
+            "detail": f"etf_ask={etf_ask.price:.0f},basket_bid={basket_proceeds:.0f}",
+            "executor": self._execute_lon_etf_underprice_arb,
+        }
+
+    def _execute_lon_etf_underprice_arb(self, arb: dict[str, Any]) -> bool:
+        size = int(arb["size"])
+        if size <= 0:
+            return False
+
+        involved = ["LON_ETF", "TIDE_SPOT", "WX_SPOT", "LHR_COUNT"]
+        for symbol in involved:
+            self._cancel_quote(symbol)
+
+        etf_resp = self._send_ioc(OrderRequest("LON_ETF", arb["etf_price"], Side.BUY, size))
+        etf_filled = etf_resp.filled if etf_resp else 0
+        if etf_filled <= 0:
+            return False
+
+        print(
+            f"ARB BUY ETF  {etf_filled} LON_ETF @ {arb['etf_price']:.0f}  "
+            f"basket={arb['basket_proceeds']:.0f} edge={arb['edge']:.1f}"
+        )
+
+        hedge_target = etf_filled
+        for leg in arb["legs"]:
+            if hedge_target <= 0:
+                break
+            resp = self._send_ioc(OrderRequest(leg["symbol"], leg["price"], leg["side"], hedge_target))
+            filled = resp.filled if resp else 0
+            if filled <= 0:
+                print(f"ARB HEDGE MISS {leg['symbol']} SELL @ {leg['price']:.0f}")
+            elif filled < hedge_target:
+                print(
+                    f"ARB HEDGE PARTIAL {leg['symbol']} SELL {filled}/{hedge_target} @ {leg['price']:.0f}"
+                )
+            else:
+                print(f"ARB HEDGE SELL {filled} {leg['symbol']} @ {leg['price']:.0f}")
+
+        return True
+
+    def _best_lon_fly_arb(
+        self,
+        books: dict[str, OrderBook],
+        positions: dict[str, int],
+    ) -> dict[str, Any] | None:
+        fly_book = books.get("LON_FLY")
+        if not fly_book:
+            return None
+
+        structural_fair = fly_payoff(max(0.0, self.theos.get("LON_ETF", 0.0)))
+        candidates: list[dict[str, Any]] = []
+
+        fly_ask = self._best_ask_order(fly_book)
+        if fly_ask:
+            available = max(0, fly_ask.volume - fly_ask.own_volume)
+            headroom = self._headroom_for_side("LON_FLY", Side.BUY, positions)
+            size = min(available, headroom, self._arb_size_cap(structural_fair - fly_ask.price, self.FLY_ARB_TAKE_EDGE))
+            edge = structural_fair - fly_ask.price
+            if edge > 0.0 and size > 0:
+                candidates.append(
+                    {
+                        "label": "BUY_FLY",
+                        "kind": "fly_underprice",
+                        "edge": edge,
+                        "size": size,
+                        "price": fly_ask.price,
+                        "side": Side.BUY,
+                        "threshold": self.FLY_ARB_TAKE_EDGE,
+                        "detail": f"fly_ask={fly_ask.price:.0f},fair={structural_fair:.0f}",
+                        "executor": self._execute_lon_fly_arb,
+                    }
+                )
+
+        fly_bid = self._best_bid_order(fly_book)
+        if fly_bid:
+            available = max(0, fly_bid.volume - fly_bid.own_volume)
+            headroom = self._headroom_for_side("LON_FLY", Side.SELL, positions)
+            size = min(available, headroom, self._arb_size_cap(fly_bid.price - structural_fair, self.FLY_ARB_TAKE_EDGE))
+            edge = fly_bid.price - structural_fair
+            if edge > 0.0 and size > 0:
+                candidates.append(
+                    {
+                        "label": "SELL_FLY",
+                        "kind": "fly_overprice",
+                        "edge": edge,
+                        "size": size,
+                        "price": fly_bid.price,
+                        "side": Side.SELL,
+                        "threshold": self.FLY_ARB_TAKE_EDGE,
+                        "detail": f"fly_bid={fly_bid.price:.0f},fair={structural_fair:.0f}",
+                        "executor": self._execute_lon_fly_arb,
+                    }
+                )
+
+        if not candidates:
+            return None
+        return max(candidates, key=lambda candidate: candidate["edge"])
+
+    def _execute_lon_fly_arb(self, arb: dict[str, Any]) -> bool:
+        size = int(arb["size"])
+        if size <= 0:
+            return False
+
+        self._cancel_quote("LON_FLY")
+        resp = self._send_ioc(OrderRequest("LON_FLY", arb["price"], arb["side"], size))
+        filled = resp.filled if resp else 0
+        if filled <= 0:
+            return False
+
+        print(
+            f"ARB {arb['label']:<8} {filled} LON_FLY @ {arb['price']:.0f}  "
+            f"edge={arb['edge']:.1f}"
+        )
         return True
 
     # ------------------------------------------------------------------
@@ -823,6 +1013,17 @@ class AlphaBot2(BaseBot):
         scale = 1.0 - clamp(utilization, 0.0, 0.8)
         edge_boost = 1.0 + 0.4 * clamp(edge / max(self.TAKE_EDGE, 1.0), 0.0, 1.5)
         return max(0, int(round(self.base_order_size * scale * edge_boost)))
+
+    def _arb_size_cap(self, edge: float, take_edge: float) -> int:
+        return max(
+            1,
+            int(
+                round(
+                    self.base_order_size
+                    * (1.4 + 0.25 * clamp(edge / max(take_edge, 1.0), 0.0, 3.0))
+                )
+            ),
+        )
 
     def _headroom_for_side(self, symbol: str, side: Side, positions: dict[str, int]) -> int:
         position = positions.get(symbol, 0)
