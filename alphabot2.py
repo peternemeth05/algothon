@@ -241,29 +241,29 @@ class AlphaBot2(BaseBot):
     REFRESH_SECS = 300.0       # External API refresh interval
     EVAL_SECS = 0.25           # Minimum seconds between evaluations
     MIN_REST_GAP = 0.25        # Rate-limit gap between exchange REST calls
-    TAKE_EDGE = 8.0            # Edge required to aggressively take liquidity
-    QUOTE_EDGE = 2.5           # Edge required to passively quote
+    TAKE_EDGE = 5.0            # Edge required to aggressively take liquidity
+    QUOTE_EDGE = 1.5           # Edge required to passively quote
     SMOOTH_ALPHA = 0.40        # EMA blending for theo smoothing
-    MAX_SIMULTANEOUS_QUOTES = 3
+    MAX_SIMULTANEOUS_QUOTES = 4
     RUN_LOOP_SLEEP = 0.10
-    ETF_ARB_TAKE_EDGE = 24.0   # Package edge required to trade ETF vs constituent basket
+    ETF_ARB_TAKE_EDGE = 20.0   # Package edge required to trade ETF vs constituent basket
     FLY_ARB_TAKE_EDGE = 20.0   # Kept for standalone relative-value helpers, not treated as true package arb
     ETF_ARB_SLIPPAGE_MULTIPLIER = 1.5
-    ETF_ARB_MAX_SIZE = 1
+    ETF_ARB_MAX_SIZE = 2
     THEO_LOG_SECS = 5.0
     FAST_MIN_HALF_WIDTH = 1.0
-    FAST_MAX_HALF_WIDTH = 3.0
+    FAST_MAX_HALF_WIDTH = 2.0
     FAST_REPRICE_TICKS = 1.0
     IMBALANCE_FAIR_WEIGHT = 0.35
-    HIGH_CONVICTION_EDGE = 6.0
-    TOP_SIGNAL_DOMINANCE_RATIO = 0.82
+    HIGH_CONVICTION_EDGE = 4.0
+    TOP_SIGNAL_DOMINANCE_RATIO = 0.88
 
     # Settlement guard: last 10 minutes before settlement
     SETTLEMENT_GUARD_MINUTES = 10
     SETTLEMENT_SPREAD_MULTIPLIER = 10.0
     CLOSEOUT_MINUTES = 3
-    CLOSEOUT_HOLD_EDGE = 12.0
-    CLOSEOUT_MAX_ABS_POSITION = 12
+    CLOSEOUT_HOLD_EDGE = 8.0
+    CLOSEOUT_MAX_ABS_POSITION = 24
     CLOSEOUT_SKIP_PRODUCTS = frozenset({"LON_FLY"})
     CLOSEOUT_PRIORITY = {
         "TIDE_SWING": 4,
@@ -1274,10 +1274,10 @@ class AlphaBot2(BaseBot):
 
     def _size_for(self, position: int, edge: float) -> int:
         utilization = abs(position) / max(self.max_position, 1)
-        scale = 1.0 - clamp(utilization, 0.0, 0.8)
-        edge_boost = 1.0 + 0.4 * clamp(edge / max(self.TAKE_EDGE, 1.0), 0.0, 1.5)
-        raw_size = self.base_order_size * 0.6 * scale * edge_boost
-        if raw_size < 0.75:
+        scale = 1.0 - clamp(utilization, 0.0, 0.9)
+        edge_boost = 1.0 + 0.8 * clamp(edge / max(self.TAKE_EDGE, 1.0), 0.0, 2.0)
+        raw_size = self.base_order_size * 1.05 * scale * edge_boost
+        if raw_size < 0.5:
             return 0
         return max(1, int(round(raw_size)))
 
@@ -1287,7 +1287,7 @@ class AlphaBot2(BaseBot):
             int(
                 round(
                     self.base_order_size
-                    * (1.4 + 0.25 * clamp(edge / max(take_edge, 1.0), 0.0, 3.0))
+                    * (1.8 + 0.45 * clamp(edge / max(take_edge, 1.0), 0.0, 3.0))
                 )
             ),
         )
@@ -1749,7 +1749,7 @@ if __name__ == "__main__":
         USERNAME,
         PASSWORD,
         aerodatabox_key=AERODATABOX_KEY,
-        base_order_size=5,
-        max_position=100,
+        base_order_size=8,
+        max_position=125,
     )
     bot.run()
