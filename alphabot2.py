@@ -245,6 +245,7 @@ class AlphaBot2(BaseBot):
     QUOTE_EDGE = 2.5           # Edge required to passively quote
     SMOOTH_ALPHA = 0.40        # EMA blending for theo smoothing
     MAX_SIMULTANEOUS_QUOTES = 3
+    RUN_LOOP_SLEEP = 0.10
     ETF_ARB_TAKE_EDGE = 24.0   # Package edge required to trade ETF vs constituent basket
     FLY_ARB_TAKE_EDGE = 20.0   # Kept for standalone relative-value helpers, not treated as true package arb
     ETF_ARB_SLIPPAGE_MULTIPLIER = 1.5
@@ -254,6 +255,8 @@ class AlphaBot2(BaseBot):
     FAST_MAX_HALF_WIDTH = 3.0
     FAST_REPRICE_TICKS = 1.0
     IMBALANCE_FAIR_WEIGHT = 0.35
+    HIGH_CONVICTION_EDGE = 6.0
+    TOP_SIGNAL_DOMINANCE_RATIO = 0.82
 
     # Settlement guard: last 10 minutes before settlement
     SETTLEMENT_GUARD_MINUTES = 10
@@ -333,7 +336,7 @@ class AlphaBot2(BaseBot):
         try:
             while True:
                 self._maybe_evaluate(force=True)
-                time.sleep(1.0)
+                time.sleep(self.RUN_LOOP_SLEEP)
         except KeyboardInterrupt:
             self._cancel_all_quotes()
             self.stop()
@@ -412,6 +415,15 @@ class AlphaBot2(BaseBot):
 
         signals.sort(key=lambda s: s["score"], reverse=True)
 
+        quote_cap = self.MAX_SIMULTANEOUS_QUOTES
+        if signals:
+            if signals[0]["edge"] >= self.HIGH_CONVICTION_EDGE:
+                quote_cap = 1
+            elif len(signals) > 1:
+                runner_up_score = max(signals[1]["score"], 1e-9)
+                if runner_up_score <= signals[0]["score"] * self.TOP_SIGNAL_DOMINANCE_RATIO:
+                    quote_cap = 1
+
         # Take the top opportunities (up to MAX_SIMULTANEOUS_QUOTES)
         quoted_products: set[str] = set()
         for sig in signals:
@@ -425,7 +437,7 @@ class AlphaBot2(BaseBot):
                 self._take_liquidity(sig, book, fair, position)
                 continue
 
-            if sig["edge"] >= self.QUOTE_EDGE and len(quoted_products) < self.MAX_SIMULTANEOUS_QUOTES:
+            if sig["edge"] >= self.QUOTE_EDGE and len(quoted_products) < quote_cap:
                 self._quote(sig, book, fair, position)
                 quoted_products.add(symbol)
 
