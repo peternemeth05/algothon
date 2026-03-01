@@ -245,8 +245,8 @@ class AlphaBot2(BaseBot):
     QUOTE_EDGE = 5.0           # Edge required to passively quote
     SMOOTH_ALPHA = 0.40        # EMA blending for theo smoothing
     MAX_SIMULTANEOUS_QUOTES = 3
-    ETF_ARB_TAKE_EDGE = 18.0   # Package edge required to short rich ETF vs buy cheap constituents
-    FLY_ARB_TAKE_EDGE = 20.0   # Package edge required to trade rich/cheap FLY vs structural value
+    ETF_ARB_TAKE_EDGE = 24.0   # Package edge required to trade ETF vs constituent basket
+    FLY_ARB_TAKE_EDGE = 20.0   # Kept for standalone relative-value helpers, not treated as true package arb
 
     # Settlement guard: last 10 minutes before settlement
     SETTLEMENT_GUARD_MINUTES = 10
@@ -606,7 +606,6 @@ class AlphaBot2(BaseBot):
         candidates = [
             self._best_lon_etf_overprice_arb(books, positions),
             self._best_lon_etf_underprice_arb(books, positions),
-            self._best_lon_fly_arb(books, positions),
         ]
         viable = [candidate for candidate in candidates if candidate and candidate["edge"] > 0.0 and candidate["size"] > 0]
         if not viable:
@@ -634,6 +633,7 @@ class AlphaBot2(BaseBot):
         etf_bid = self._best_bid_order(etf_book)
         if not etf_bid:
             return None
+        etf_ask = self._best_ask_order(etf_book)
 
         leg_symbols = ("TIDE_SPOT", "WX_SPOT", "LHR_COUNT")
         legs: list[dict[str, Any]] = []
@@ -649,6 +649,7 @@ class AlphaBot2(BaseBot):
         for symbol in leg_symbols:
             book = books.get(symbol)
             ask_order = self._best_ask_order(book) if book else None
+            bid_order = self._best_bid_order(book) if book else None
             if not ask_order:
                 return None
 
@@ -660,7 +661,15 @@ class AlphaBot2(BaseBot):
 
             max_size = min(max_size, leg_cap)
             basket_cost += ask_order.price
-            legs.append({"symbol": symbol, "price": ask_order.price, "side": Side.BUY})
+            legs.append(
+                {
+                    "symbol": symbol,
+                    "price": ask_order.price,
+                    "side": Side.BUY,
+                    "unwind_side": Side.SELL,
+                    "unwind_price": bid_order.price if bid_order else ask_order.price,
+                }
+            )
 
         edge = etf_bid.price - basket_cost
         if edge <= 0.0 or max_size <= 0:
@@ -674,6 +683,7 @@ class AlphaBot2(BaseBot):
             "edge": edge,
             "size": min(max_size, size_cap),
             "etf_price": etf_bid.price,
+            "etf_unwind_price": etf_ask.price if etf_ask else etf_bid.price,
             "basket_cost": basket_cost,
             "legs": legs,
             "threshold": self.ETF_ARB_TAKE_EDGE,
@@ -701,11 +711,13 @@ class AlphaBot2(BaseBot):
         )
 
         hedge_target = etf_filled
+        leg_fills: list[tuple[dict[str, Any], int]] = []
         for leg in arb["legs"]:
             if hedge_target <= 0:
                 break
             resp = self._send_ioc(OrderRequest(leg["symbol"], leg["price"], leg["side"], hedge_target))
             filled = resp.filled if resp else 0
+            leg_fills.append((leg, filled))
             if filled <= 0:
                 print(f"ARB HEDGE MISS {leg['symbol']} BUY @ {leg['price']:.0f}")
             elif filled < hedge_target:
@@ -715,6 +727,13 @@ class AlphaBot2(BaseBot):
             else:
                 print(f"ARB HEDGE BUY {filled} {leg['symbol']} @ {leg['price']:.0f}")
 
+        self._flatten_package_residual(
+            anchor_symbol="LON_ETF",
+            anchor_side=Side.SELL,
+            anchor_filled=etf_filled,
+            anchor_unwind_price=float(arb["etf_unwind_price"]),
+            leg_fills=leg_fills,
+        )
         return True
 
     def _best_lon_etf_underprice_arb(
@@ -729,6 +748,7 @@ class AlphaBot2(BaseBot):
         etf_ask = self._best_ask_order(etf_book)
         if not etf_ask:
             return None
+        etf_bid = self._best_bid_order(etf_book)
 
         leg_symbols = ("TIDE_SPOT", "WX_SPOT", "LHR_COUNT")
         legs: list[dict[str, Any]] = []
@@ -743,6 +763,7 @@ class AlphaBot2(BaseBot):
         for symbol in leg_symbols:
             book = books.get(symbol)
             bid_order = self._best_bid_order(book) if book else None
+            ask_order = self._best_ask_order(book) if book else None
             if not bid_order:
                 return None
 
@@ -754,7 +775,15 @@ class AlphaBot2(BaseBot):
 
             max_size = min(max_size, leg_cap)
             basket_proceeds += bid_order.price
-            legs.append({"symbol": symbol, "price": bid_order.price, "side": Side.SELL})
+            legs.append(
+                {
+                    "symbol": symbol,
+                    "price": bid_order.price,
+                    "side": Side.SELL,
+                    "unwind_side": Side.BUY,
+                    "unwind_price": ask_order.price if ask_order else bid_order.price,
+                }
+            )
 
         edge = basket_proceeds - etf_ask.price
         if edge <= 0.0 or max_size <= 0:
@@ -768,6 +797,7 @@ class AlphaBot2(BaseBot):
             "edge": edge,
             "size": min(max_size, size_cap),
             "etf_price": etf_ask.price,
+            "etf_unwind_price": etf_bid.price if etf_bid else etf_ask.price,
             "basket_proceeds": basket_proceeds,
             "legs": legs,
             "threshold": self.ETF_ARB_TAKE_EDGE,
@@ -795,11 +825,13 @@ class AlphaBot2(BaseBot):
         )
 
         hedge_target = etf_filled
+        leg_fills: list[tuple[dict[str, Any], int]] = []
         for leg in arb["legs"]:
             if hedge_target <= 0:
                 break
             resp = self._send_ioc(OrderRequest(leg["symbol"], leg["price"], leg["side"], hedge_target))
             filled = resp.filled if resp else 0
+            leg_fills.append((leg, filled))
             if filled <= 0:
                 print(f"ARB HEDGE MISS {leg['symbol']} SELL @ {leg['price']:.0f}")
             elif filled < hedge_target:
@@ -809,6 +841,13 @@ class AlphaBot2(BaseBot):
             else:
                 print(f"ARB HEDGE SELL {filled} {leg['symbol']} @ {leg['price']:.0f}")
 
+        self._flatten_package_residual(
+            anchor_symbol="LON_ETF",
+            anchor_side=Side.BUY,
+            anchor_filled=etf_filled,
+            anchor_unwind_price=float(arb["etf_unwind_price"]),
+            leg_fills=leg_fills,
+        )
         return True
 
     def _best_lon_fly_arb(
@@ -1024,6 +1063,42 @@ class AlphaBot2(BaseBot):
                 )
             ),
         )
+
+    def _flatten_package_residual(
+        self,
+        *,
+        anchor_symbol: str,
+        anchor_side: Side,
+        anchor_filled: int,
+        anchor_unwind_price: float,
+        leg_fills: list[tuple[dict[str, Any], int]],
+    ) -> None:
+        if anchor_filled <= 0:
+            return
+
+        matched = min([anchor_filled] + [filled for _, filled in leg_fills]) if leg_fills else 0
+        if matched >= anchor_filled and all(filled == matched for _, filled in leg_fills):
+            return
+
+        residual_anchor = anchor_filled - matched
+        if residual_anchor > 0:
+            unwind_side = Side.BUY if anchor_side == Side.SELL else Side.SELL
+            resp = self._send_ioc(OrderRequest(anchor_symbol, anchor_unwind_price, unwind_side, residual_anchor))
+            filled = resp.filled if resp else 0
+            print(
+                f"ARB UNWIND {anchor_symbol} {unwind_side.name} {filled}/{residual_anchor} @ {anchor_unwind_price:.0f}"
+            )
+
+        for leg, filled in leg_fills:
+            excess = filled - matched
+            if excess <= 0:
+                continue
+            resp = self._send_ioc(OrderRequest(leg["symbol"], leg["unwind_price"], leg["unwind_side"], excess))
+            unwind_filled = resp.filled if resp else 0
+            print(
+                f"ARB UNWIND {leg['symbol']} {leg['unwind_side'].name} "
+                f"{unwind_filled}/{excess} @ {leg['unwind_price']:.0f}"
+            )
 
     def _headroom_for_side(self, symbol: str, side: Side, positions: dict[str, int]) -> int:
         position = positions.get(symbol, 0)
