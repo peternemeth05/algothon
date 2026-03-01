@@ -281,6 +281,8 @@ class AlphaBot2(BaseBot):
         self.last_refresh_at = 0.0
         self.last_eval_at = 0.0
         self.last_rest_at = 0.0
+        self.flight_backoff_until = 0.0
+        self.flight_backoff_seconds = max(self.REFRESH_SECS * 2.0, 600.0)
 
         self._lock = threading.Lock()
         self._eval_lock = threading.Lock()
@@ -497,13 +499,17 @@ class AlphaBot2(BaseBot):
             cancellations = float(flights.get("cancellations", 0))
             return max(0.0, api_count - cancellations)
 
-        # Infer from ETF mid
-        etf_mid = self._mid(books.get("LON_ETF"))
-        if etf_mid is not None:
-            return max(0.0, etf_mid - tide_spot - wx_spot)
-
         product = self.products.get("LHR_COUNT")
-        return float(product.startingPrice) if product else 1500.0
+        baseline = float(product.startingPrice) if product else 1280.0
+
+        now_london = datetime.now(LONDON_TZ)
+        hour = now_london.hour + now_london.minute / 60.0
+        if 23.0 <= hour or hour < 5.0:
+            baseline -= 20.0
+        elif 5.0 <= hour < 8.0:
+            baseline += 10.0
+
+        return max(0.0, baseline)
 
     # --- LHR_INDEX ---
 
@@ -917,6 +923,12 @@ class AlphaBot2(BaseBot):
 
     def _fetch_flights(self) -> dict[str, Any]:
         """Fetch Heathrow flight schedule for the settlement window (Sat 12PM – Sun 12PM)."""
+        now_monotonic = time.monotonic()
+        if now_monotonic < self.flight_backoff_until:
+            remaining = int(self.flight_backoff_until - now_monotonic)
+            print(f"Flight API backoff active ({remaining}s remaining); using cached flight data.")
+            return self.external_cache.get("flights", {})
+
         try:
             settle = self._next_settlement_time()
             window_start = settle - timedelta(hours=24)
@@ -978,6 +990,9 @@ class AlphaBot2(BaseBot):
                     index_sum += metric
                 bucket_start = bucket_end
 
+            self.flight_backoff_until = 0.0
+            self.flight_backoff_seconds = max(self.REFRESH_SECS * 2.0, 600.0)
+
             return {
                 "count": float(total_count),
                 "cancellations": float(cancellations),
@@ -985,6 +1000,26 @@ class AlphaBot2(BaseBot):
                 "departures": total_departures,
                 "index": abs(index_sum),
             }
+        except requests.exceptions.HTTPError as exc:
+            response = exc.response
+            if response is not None and response.status_code == 429:
+                retry_after = 0.0
+                retry_after_raw = response.headers.get("Retry-After")
+                if retry_after_raw:
+                    try:
+                        retry_after = float(retry_after_raw)
+                    except ValueError:
+                        retry_after = 0.0
+                delay = retry_after if retry_after > 0.0 else min(self.flight_backoff_seconds, 3600.0)
+                self.flight_backoff_until = time.monotonic() + delay
+                self.flight_backoff_seconds = min(max(delay * 2.0, self.REFRESH_SECS * 2.0), 3600.0)
+                print(
+                    f"Warning: flight fetch rate-limited (429). "
+                    f"Backing off for {int(delay)}s and using cached flight data."
+                )
+                return self.external_cache.get("flights", {})
+            print(f"Warning: flight fetch failed: {exc}")
+            return self.external_cache.get("flights", {})
         except Exception as exc:
             print(f"Warning: flight fetch failed: {exc}")
             return self.external_cache.get("flights", {})

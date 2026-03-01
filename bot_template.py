@@ -173,13 +173,38 @@ class _SSEThread(Thread):
             except json.JSONDecodeError:
                 continue
 
-            if event.event == "order":
+            # Some exchange deployments emit unnamed SSE messages ("message").
+            # Infer the payload type from its shape instead of relying only on
+            # the SSE event label, otherwise order books can be silently dropped.
+            if self._looks_like_orderbook(parsed):
                 self._on_order_event(parsed)
-            elif event.event == "trade":
+                continue
+
+            if self._looks_like_trade_payload(parsed):
                 trades = parsed if isinstance(parsed, list) else [parsed]
                 trade_fields = {f.name for f in Trade.__dataclass_fields__.values()}
                 for t in trades:
-                    self._handle_trade_event(Trade(**{k: v for k, v in t.items() if k in trade_fields}))
+                    if not isinstance(t, dict):
+                        continue
+                    filtered = {k: v for k, v in t.items() if k in trade_fields}
+                    if {"timestamp", "product", "buyer", "seller", "volume", "price"} <= filtered.keys():
+                        self._handle_trade_event(Trade(**filtered))
+
+    def _looks_like_orderbook(self, payload: Any) -> bool:
+        return (
+            isinstance(payload, dict)
+            and "productsymbol" in payload
+            and "buyOrders" in payload
+            and "sellOrders" in payload
+        )
+
+    def _looks_like_trade_payload(self, payload: Any) -> bool:
+        if isinstance(payload, list):
+            return bool(payload) and all(
+                isinstance(item, dict) and "product" in item and "price" in item and "volume" in item
+                for item in payload
+            )
+        return isinstance(payload, dict) and "product" in payload and "price" in payload and "volume" in payload
 
     def _on_order_event(self, data: dict[str, Any]):
         buy_orders = sorted(
