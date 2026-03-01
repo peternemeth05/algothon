@@ -245,6 +245,7 @@ class AlphaBot2(BaseBot):
     QUOTE_EDGE = 5.0           # Edge required to passively quote
     SMOOTH_ALPHA = 0.40        # EMA blending for theo smoothing
     MAX_SIMULTANEOUS_QUOTES = 3
+    ETF_ARB_TAKE_EDGE = 18.0   # Package edge required to short rich ETF vs buy cheap constituents
 
     # Settlement guard: last 10 minutes before settlement
     SETTLEMENT_GUARD_MINUTES = 10
@@ -371,6 +372,19 @@ class AlphaBot2(BaseBot):
         # Log theos periodically
         theo_str = "  ".join(f"{s}={v:.0f}" for s, v in self.theos.items())
         print(f"THEOS  {theo_str}")
+
+        etf_overprice_arb = self._best_lon_etf_overprice_arb(books, positions)
+        if etf_overprice_arb:
+            print(
+                "ARBCHK "
+                f"etf_bid={etf_overprice_arb['etf_price']:.0f} "
+                f"basket_ask={etf_overprice_arb['basket_cost']:.0f} "
+                f"edge={etf_overprice_arb['edge']:.1f} "
+                f"size={etf_overprice_arb['size']}"
+            )
+            if etf_overprice_arb["edge"] >= self.ETF_ARB_TAKE_EDGE:
+                if self._execute_lon_etf_overprice_arb(etf_overprice_arb):
+                    return
 
         # Rank opportunities across all 8 products
         signals = []
@@ -584,6 +598,104 @@ class AlphaBot2(BaseBot):
                 self._send_ioc(OrderRequest(symbol, best_bid_order.price, Side.SELL, size))
                 print(f"HIT SELL {size} {symbol} @ {best_bid_order.price:.0f}  theo={fair:.1f}")
 
+    def _best_lon_etf_overprice_arb(
+        self,
+        books: dict[str, OrderBook],
+        positions: dict[str, int],
+    ) -> dict[str, Any] | None:
+        etf_book = books.get("LON_ETF")
+        if not etf_book:
+            return None
+
+        etf_bid = self._best_bid_order(etf_book)
+        if not etf_bid:
+            return None
+
+        leg_symbols = ("TIDE_SPOT", "WX_SPOT", "LHR_COUNT")
+        legs: list[dict[str, Any]] = []
+        basket_cost = 0.0
+        max_size = None
+
+        etf_headroom = self._headroom_for_side("LON_ETF", Side.SELL, positions)
+        etf_available = max(0, etf_bid.volume - etf_bid.own_volume)
+        max_size = min(etf_headroom, etf_available)
+        if max_size <= 0:
+            return None
+
+        for symbol in leg_symbols:
+            book = books.get(symbol)
+            ask_order = self._best_ask_order(book) if book else None
+            if not ask_order:
+                return None
+
+            available = max(0, ask_order.volume - ask_order.own_volume)
+            headroom = self._headroom_for_side(symbol, Side.BUY, positions)
+            leg_cap = min(available, headroom)
+            if leg_cap <= 0:
+                return None
+
+            max_size = min(max_size, leg_cap)
+            basket_cost += ask_order.price
+            legs.append({"symbol": symbol, "price": ask_order.price, "side": Side.BUY})
+
+        edge = etf_bid.price - basket_cost
+        if edge <= 0.0 or max_size <= 0:
+            return None
+
+        size_cap = max(
+            1,
+            int(
+                round(
+                    self.base_order_size
+                    * (1.4 + 0.25 * clamp(edge / max(self.ETF_ARB_TAKE_EDGE, 1.0), 0.0, 3.0))
+                )
+            ),
+        )
+
+        return {
+            "edge": edge,
+            "size": min(max_size, size_cap),
+            "etf_price": etf_bid.price,
+            "basket_cost": basket_cost,
+            "legs": legs,
+        }
+
+    def _execute_lon_etf_overprice_arb(self, arb: dict[str, Any]) -> bool:
+        size = int(arb["size"])
+        if size <= 0:
+            return False
+
+        involved = ["LON_ETF", "TIDE_SPOT", "WX_SPOT", "LHR_COUNT"]
+        for symbol in involved:
+            self._cancel_quote(symbol)
+
+        etf_resp = self._send_ioc(OrderRequest("LON_ETF", arb["etf_price"], Side.SELL, size))
+        etf_filled = etf_resp.filled if etf_resp else 0
+        if etf_filled <= 0:
+            return False
+
+        print(
+            f"ARB SELL ETF {etf_filled} LON_ETF @ {arb['etf_price']:.0f}  "
+            f"basket={arb['basket_cost']:.0f} edge={arb['edge']:.1f}"
+        )
+
+        hedge_target = etf_filled
+        for leg in arb["legs"]:
+            if hedge_target <= 0:
+                break
+            resp = self._send_ioc(OrderRequest(leg["symbol"], leg["price"], leg["side"], hedge_target))
+            filled = resp.filled if resp else 0
+            if filled <= 0:
+                print(f"ARB HEDGE MISS {leg['symbol']} BUY @ {leg['price']:.0f}")
+            elif filled < hedge_target:
+                print(
+                    f"ARB HEDGE PARTIAL {leg['symbol']} BUY {filled}/{hedge_target} @ {leg['price']:.0f}"
+                )
+            else:
+                print(f"ARB HEDGE BUY {filled} {leg['symbol']} @ {leg['price']:.0f}")
+
+        return True
+
     # ------------------------------------------------------------------
     # Execution: passive quoting
     # ------------------------------------------------------------------
@@ -711,6 +823,12 @@ class AlphaBot2(BaseBot):
         scale = 1.0 - clamp(utilization, 0.0, 0.8)
         edge_boost = 1.0 + 0.4 * clamp(edge / max(self.TAKE_EDGE, 1.0), 0.0, 1.5)
         return max(0, int(round(self.base_order_size * scale * edge_boost)))
+
+    def _headroom_for_side(self, symbol: str, side: Side, positions: dict[str, int]) -> int:
+        position = positions.get(symbol, 0)
+        if side == Side.BUY:
+            return max(0, self.max_position - position)
+        return max(0, self.max_position + position)
 
     # ------------------------------------------------------------------
     # Theo smoothing
