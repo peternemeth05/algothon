@@ -261,6 +261,19 @@ class AlphaBot2(BaseBot):
     # Settlement guard: last 10 minutes before settlement
     SETTLEMENT_GUARD_MINUTES = 10
     SETTLEMENT_SPREAD_MULTIPLIER = 10.0
+    CLOSEOUT_MINUTES = 3
+    CLOSEOUT_HOLD_EDGE = 12.0
+    CLOSEOUT_MAX_ABS_POSITION = 12
+    CLOSEOUT_SKIP_PRODUCTS = frozenset({"LON_FLY"})
+    CLOSEOUT_PRIORITY = {
+        "TIDE_SWING": 4,
+        "WX_SUM": 4,
+        "LHR_COUNT": 4,
+        "TIDE_SPOT": 3,
+        "WX_SPOT": 3,
+        "LON_ETF": 2,
+        "LHR_INDEX": 1,
+    }
 
     def __init__(
         self,
@@ -387,6 +400,10 @@ class AlphaBot2(BaseBot):
             theo_str = "  ".join(f"{s}={v:.0f}" for s, v in self.theos.items())
             print(f"THEOS  {theo_str}")
             self.last_theo_log_at = now_monotonic
+
+        if self._in_closeout_window():
+            self._run_closeout(books, positions)
+            return
 
         best_arb = self._best_structural_arb(books, positions)
         if best_arb:
@@ -985,6 +1002,149 @@ class AlphaBot2(BaseBot):
         return True
 
     # ------------------------------------------------------------------
+    # Settlement closeout
+    # ------------------------------------------------------------------
+
+    def _run_closeout(self, books: dict[str, OrderBook], positions: dict[str, int]) -> None:
+        minutes_to_settle = self._minutes_to_settlement()
+        self._cancel_all_quotes()
+
+        candidates: list[dict[str, Any]] = []
+        for symbol in self.WATCHLIST:
+            if symbol in self.CLOSEOUT_SKIP_PRODUCTS:
+                continue
+            book = books.get(symbol)
+            fair = self.theos.get(symbol)
+            if not book or fair is None:
+                continue
+            sig = self._signal_for(symbol, book, fair, positions.get(symbol, 0))
+            if not sig or sig["edge"] < self.CLOSEOUT_HOLD_EDGE:
+                continue
+            sig["direction"] = Side.BUY if sig["buy_edge"] >= sig["sell_edge"] else Side.SELL
+            candidates.append(sig)
+
+        candidates.sort(
+            key=lambda sig: (
+                self.CLOSEOUT_PRIORITY.get(sig["product"], 0),
+                sig["edge"],
+                sig["score"],
+            ),
+            reverse=True,
+        )
+
+        keeper = candidates[0] if candidates else None
+        keeper_symbol = keeper["product"] if keeper else None
+        desired_sign = 0
+        desired_abs = min(self.CLOSEOUT_MAX_ABS_POSITION, self.max_position)
+
+        if keeper:
+            desired_sign = 1 if keeper["direction"] == Side.BUY else -1
+            print(
+                f"CLOSEOUT keep={keeper_symbol} dir={keeper['direction'].name} "
+                f"edge={keeper['edge']:.1f} tts={minutes_to_settle:.1f}m"
+            )
+        else:
+            print(f"CLOSEOUT flatten-all tts={minutes_to_settle:.1f}m")
+
+        working_positions = dict(positions)
+
+        for symbol, position in list(working_positions.items()):
+            if position == 0:
+                continue
+            book = books.get(symbol)
+            if not book:
+                continue
+
+            if symbol != keeper_symbol:
+                working_positions[symbol] = self._rebalance_position(
+                    symbol,
+                    book,
+                    position,
+                    0,
+                    "CLOSEOUT FLAT",
+                )
+                continue
+
+            if desired_sign == 0:
+                continue
+
+            if position * desired_sign < 0:
+                position = self._rebalance_position(
+                    symbol,
+                    book,
+                    position,
+                    0,
+                    "CLOSEOUT FLIP",
+                )
+
+            if abs(position) > desired_abs:
+                position = self._rebalance_position(
+                    symbol,
+                    book,
+                    position,
+                    desired_sign * desired_abs,
+                    "CLOSEOUT TRIM",
+                )
+
+            working_positions[symbol] = position
+
+        if keeper and books.get(keeper_symbol):
+            current = working_positions.get(keeper_symbol, 0)
+            if current * desired_sign >= 0 and abs(current) < desired_abs:
+                self._rebalance_position(
+                    keeper_symbol,
+                    books[keeper_symbol],
+                    current,
+                    desired_sign * desired_abs,
+                    "CLOSEOUT HOLD",
+                )
+
+    def _rebalance_position(
+        self,
+        symbol: str,
+        book: OrderBook,
+        position: int,
+        target: int,
+        reason: str,
+    ) -> int:
+        delta = target - position
+        if delta == 0:
+            return position
+
+        if delta > 0:
+            filled = self._trade_top(symbol, book, Side.BUY, delta, reason)
+            return position + filled
+
+        filled = self._trade_top(symbol, book, Side.SELL, -delta, reason)
+        return position - filled
+
+    def _trade_top(
+        self,
+        symbol: str,
+        book: OrderBook,
+        side: Side,
+        requested_size: int,
+        reason: str,
+    ) -> int:
+        if requested_size <= 0:
+            return 0
+
+        top = self._best_ask_order(book) if side == Side.BUY else self._best_bid_order(book)
+        if not top:
+            return 0
+
+        available = max(0, top.volume - top.own_volume)
+        size = min(requested_size, available)
+        if size <= 0:
+            return 0
+
+        resp = self._send_ioc(OrderRequest(symbol, top.price, side, size))
+        filled = resp.filled if resp else 0
+        if filled > 0:
+            print(f"{reason} {side.name} {filled}/{size} {symbol} @ {top.price:.0f}")
+        return filled
+
+    # ------------------------------------------------------------------
     # Execution: passive quoting
     # ------------------------------------------------------------------
 
@@ -1101,10 +1261,12 @@ class AlphaBot2(BaseBot):
 
     def _in_settlement_guard(self) -> bool:
         """Return True if we are within the final SETTLEMENT_GUARD_MINUTES before settlement."""
-        settle = self._next_settlement_time()
-        now = datetime.now(LONDON_TZ)
-        minutes_to_settle = (settle - now).total_seconds() / 60.0
+        minutes_to_settle = self._minutes_to_settlement()
         return 0 < minutes_to_settle <= self.SETTLEMENT_GUARD_MINUTES
+
+    def _in_closeout_window(self) -> bool:
+        minutes_to_settle = self._minutes_to_settlement()
+        return 0 < minutes_to_settle <= self.CLOSEOUT_MINUTES
 
     # ------------------------------------------------------------------
     # Sizing
@@ -1548,6 +1710,11 @@ class AlphaBot2(BaseBot):
         if now >= settle:
             settle += timedelta(days=1)
         return settle
+
+    def _minutes_to_settlement(self) -> float:
+        settle = self._next_settlement_time()
+        now = datetime.now(LONDON_TZ)
+        return (settle - now).total_seconds() / 60.0
 
     def _paced(self, func) -> Any:
         wait = self.MIN_REST_GAP - (time.monotonic() - self.last_rest_at)
