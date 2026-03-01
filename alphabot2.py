@@ -239,14 +239,21 @@ class AlphaBot2(BaseBot):
 
     # --- Tuning knobs ---
     REFRESH_SECS = 300.0       # External API refresh interval
-    EVAL_SECS = 2.5            # Minimum seconds between evaluations
-    MIN_REST_GAP = 1.05        # Rate-limit gap between exchange REST calls
-    TAKE_EDGE = 12.0           # Edge required to aggressively take liquidity
-    QUOTE_EDGE = 5.0           # Edge required to passively quote
+    EVAL_SECS = 0.25           # Minimum seconds between evaluations
+    MIN_REST_GAP = 0.25        # Rate-limit gap between exchange REST calls
+    TAKE_EDGE = 8.0            # Edge required to aggressively take liquidity
+    QUOTE_EDGE = 2.5           # Edge required to passively quote
     SMOOTH_ALPHA = 0.40        # EMA blending for theo smoothing
     MAX_SIMULTANEOUS_QUOTES = 3
     ETF_ARB_TAKE_EDGE = 24.0   # Package edge required to trade ETF vs constituent basket
     FLY_ARB_TAKE_EDGE = 20.0   # Kept for standalone relative-value helpers, not treated as true package arb
+    ETF_ARB_SLIPPAGE_MULTIPLIER = 1.5
+    ETF_ARB_MAX_SIZE = 1
+    THEO_LOG_SECS = 5.0
+    FAST_MIN_HALF_WIDTH = 1.0
+    FAST_MAX_HALF_WIDTH = 3.0
+    FAST_REPRICE_TICKS = 1.0
+    IMBALANCE_FAIR_WEIGHT = 0.35
 
     # Settlement guard: last 10 minutes before settlement
     SETTLEMENT_GUARD_MINUTES = 10
@@ -284,6 +291,7 @@ class AlphaBot2(BaseBot):
         self.last_eval_at = 0.0
         self.last_rest_at = 0.0
         self.last_book_poll_at = 0.0
+        self.last_theo_log_at = 0.0
         self.flight_backoff_until = 0.0
         self.flight_backoff_seconds = max(self.REFRESH_SECS * 2.0, 600.0)
 
@@ -370,15 +378,20 @@ class AlphaBot2(BaseBot):
         raw_theos = self._build_theos(books)
         self.theos = self._smooth_theos(raw_theos)
 
-        # Log theos periodically
-        theo_str = "  ".join(f"{s}={v:.0f}" for s, v in self.theos.items())
-        print(f"THEOS  {theo_str}")
+        # Log theos periodically (avoid spamming while evaluating faster)
+        now_monotonic = time.monotonic()
+        if now_monotonic - self.last_theo_log_at >= self.THEO_LOG_SECS:
+            theo_str = "  ".join(f"{s}={v:.0f}" for s, v in self.theos.items())
+            print(f"THEOS  {theo_str}")
+            self.last_theo_log_at = now_monotonic
 
         best_arb = self._best_structural_arb(books, positions)
         if best_arb:
             print(
                 f"ARBCHK {best_arb['label']} "
                 f"edge={best_arb['edge']:.1f} "
+                f"raw={best_arb['raw_edge']:.1f} "
+                f"slip={best_arb['slippage_budget']:.1f} "
                 f"size={best_arb['size']} "
                 f"detail={best_arb['detail']}"
             )
@@ -546,10 +559,27 @@ class AlphaBot2(BaseBot):
     def _signal_for(
         self, symbol: str, book: OrderBook, fair: float, position: int,
     ) -> dict[str, Any] | None:
-        best_bid = self._best_bid(book)
-        best_ask = self._best_ask(book)
+        best_bid_order = self._best_bid_order(book)
+        best_ask_order = self._best_ask_order(book)
+        best_bid = best_bid_order.price if best_bid_order else None
+        best_ask = best_ask_order.price if best_ask_order else None
         if best_bid is None and best_ask is None:
             return None
+
+        spread = (best_ask - best_bid) if best_bid is not None and best_ask is not None else None
+        micro_adjust = 0.0
+        if spread is not None and best_bid_order and best_ask_order:
+            bid_available = max(0, best_bid_order.volume - best_bid_order.own_volume)
+            ask_available = max(0, best_ask_order.volume - best_ask_order.own_volume)
+            total_available = bid_available + ask_available
+            if total_available > 0:
+                imbalance = (bid_available - ask_available) / total_available
+                micro_adjust = clamp(
+                    imbalance * max(spread, 1.0) * self.IMBALANCE_FAIR_WEIGHT,
+                    -2.0,
+                    2.0,
+                )
+                fair += micro_adjust
 
         limit = self.max_position
         buy_edge = (fair - best_ask) if best_ask is not None and position < limit else float("-inf")
@@ -560,8 +590,9 @@ class AlphaBot2(BaseBot):
 
         # Inventory penalty to discourage concentration
         utilization = abs(position) / max(limit, 1)
-        inventory_penalty = max(0.0, utilization - 0.3) * self.QUOTE_EDGE
-        score = edge - inventory_penalty
+        inventory_penalty = max(0.0, utilization - 0.6) * self.QUOTE_EDGE * 0.75
+        spread_bonus = max(0.0, 4.0 - spread) * 0.4 if spread is not None else 0.0
+        score = edge - inventory_penalty + spread_bonus
 
         return {
             "product": symbol,
@@ -569,6 +600,8 @@ class AlphaBot2(BaseBot):
             "score": score,
             "buy_edge": max(0.0, buy_edge),
             "sell_edge": max(0.0, sell_edge),
+            "micro_adjust": micro_adjust,
+            "spread": spread,
         }
 
     # ------------------------------------------------------------------
@@ -634,10 +667,13 @@ class AlphaBot2(BaseBot):
         if not etf_bid:
             return None
         etf_ask = self._best_ask_order(etf_book)
+        if not etf_ask:
+            return None
 
         leg_symbols = ("TIDE_SPOT", "WX_SPOT", "LHR_COUNT")
         legs: list[dict[str, Any]] = []
         basket_cost = 0.0
+        slippage_budget = etf_ask.price - etf_bid.price
         max_size = None
 
         etf_headroom = self._headroom_for_side("LON_ETF", Side.SELL, positions)
@@ -650,7 +686,7 @@ class AlphaBot2(BaseBot):
             book = books.get(symbol)
             ask_order = self._best_ask_order(book) if book else None
             bid_order = self._best_bid_order(book) if book else None
-            if not ask_order:
+            if not ask_order or not bid_order:
                 return None
 
             available = max(0, ask_order.volume - ask_order.own_volume)
@@ -661,6 +697,7 @@ class AlphaBot2(BaseBot):
 
             max_size = min(max_size, leg_cap)
             basket_cost += ask_order.price
+            slippage_budget += max(0.0, ask_order.price - bid_order.price)
             legs.append(
                 {
                     "symbol": symbol,
@@ -671,7 +708,8 @@ class AlphaBot2(BaseBot):
                 }
             )
 
-        edge = etf_bid.price - basket_cost
+        raw_edge = etf_bid.price - basket_cost
+        edge = raw_edge - self.ETF_ARB_SLIPPAGE_MULTIPLIER * slippage_budget
         if edge <= 0.0 or max_size <= 0:
             return None
 
@@ -681,7 +719,9 @@ class AlphaBot2(BaseBot):
             "label": "SELL_ETF_BUY_BASKET",
             "kind": "etf_overprice",
             "edge": edge,
-            "size": min(max_size, size_cap),
+            "raw_edge": raw_edge,
+            "slippage_budget": slippage_budget,
+            "size": min(max_size, size_cap, self.ETF_ARB_MAX_SIZE),
             "etf_price": etf_bid.price,
             "etf_unwind_price": etf_ask.price if etf_ask else etf_bid.price,
             "basket_cost": basket_cost,
@@ -749,10 +789,13 @@ class AlphaBot2(BaseBot):
         if not etf_ask:
             return None
         etf_bid = self._best_bid_order(etf_book)
+        if not etf_bid:
+            return None
 
         leg_symbols = ("TIDE_SPOT", "WX_SPOT", "LHR_COUNT")
         legs: list[dict[str, Any]] = []
         basket_proceeds = 0.0
+        slippage_budget = etf_ask.price - etf_bid.price
 
         etf_headroom = self._headroom_for_side("LON_ETF", Side.BUY, positions)
         etf_available = max(0, etf_ask.volume - etf_ask.own_volume)
@@ -764,7 +807,7 @@ class AlphaBot2(BaseBot):
             book = books.get(symbol)
             bid_order = self._best_bid_order(book) if book else None
             ask_order = self._best_ask_order(book) if book else None
-            if not bid_order:
+            if not bid_order or not ask_order:
                 return None
 
             available = max(0, bid_order.volume - bid_order.own_volume)
@@ -775,6 +818,7 @@ class AlphaBot2(BaseBot):
 
             max_size = min(max_size, leg_cap)
             basket_proceeds += bid_order.price
+            slippage_budget += max(0.0, ask_order.price - bid_order.price)
             legs.append(
                 {
                     "symbol": symbol,
@@ -785,7 +829,8 @@ class AlphaBot2(BaseBot):
                 }
             )
 
-        edge = basket_proceeds - etf_ask.price
+        raw_edge = basket_proceeds - etf_ask.price
+        edge = raw_edge - self.ETF_ARB_SLIPPAGE_MULTIPLIER * slippage_budget
         if edge <= 0.0 or max_size <= 0:
             return None
 
@@ -795,7 +840,9 @@ class AlphaBot2(BaseBot):
             "label": "BUY_ETF_SELL_BASKET",
             "kind": "etf_underprice",
             "edge": edge,
-            "size": min(max_size, size_cap),
+            "raw_edge": raw_edge,
+            "slippage_budget": slippage_budget,
+            "size": min(max_size, size_cap, self.ETF_ARB_MAX_SIZE),
             "etf_price": etf_ask.price,
             "etf_unwind_price": etf_bid.price if etf_bid else etf_ask.price,
             "basket_proceeds": basket_proceeds,
@@ -947,8 +994,10 @@ class AlphaBot2(BaseBot):
             return
 
         # Width determination
-        spread = (best_ask - best_bid) if best_bid is not None and best_ask is not None else 8.0
-        half_width = max(5.0, spread / 2.0)
+        spread = (best_ask - best_bid) if best_bid is not None and best_ask is not None else 4.0
+        half_width = clamp(spread / 2.0, self.FAST_MIN_HALF_WIDTH, self.FAST_MAX_HALF_WIDTH)
+        if signal["edge"] >= 0.75 * self.TAKE_EDGE:
+            half_width = max(self.FAST_MIN_HALF_WIDTH, half_width - 0.5 * tick)
 
         # Settlement guard: widen spreads 10× in final 10 minutes
         if self._in_settlement_guard():
@@ -956,7 +1005,7 @@ class AlphaBot2(BaseBot):
             print(f"SETTLEMENT GUARD active for {symbol}: spread widened to {half_width * 2:.0f}")
 
         # Inventory skew
-        skew = clamp(position / max(limit, 1), -1.0, 1.0) * 4.0
+        skew = clamp(position / max(limit, 1), -1.0, 1.0) * 2.0
 
         bid_price = math.floor((fair - half_width - skew) / tick) * tick
         ask_price = math.ceil((fair + half_width - skew) / tick) * tick
@@ -973,18 +1022,20 @@ class AlphaBot2(BaseBot):
             self._cancel_quote(symbol)
             return
 
-        # ORDER REFRESH GUARD: only cancel/replace if theo moved by > 2×tick
+        # ORDER REFRESH GUARD: only cancel/replace if theo moved by more than the
+        # configured HFT reprice threshold; this keeps queue priority while still
+        # letting us react quickly.
         existing = self.active_quotes.get(symbol)
         if existing:
             bid_unchanged = (existing.bid_price is None and target_bid is None) or (
                 existing.bid_price is not None
                 and target_bid is not None
-                and abs(existing.bid_price - target_bid) <= 2.0 * tick
+                and abs(existing.bid_price - target_bid) <= self.FAST_REPRICE_TICKS * tick
             )
             ask_unchanged = (existing.ask_price is None and target_ask is None) or (
                 existing.ask_price is not None
                 and target_ask is not None
-                and abs(existing.ask_price - target_ask) <= 2.0 * tick
+                and abs(existing.ask_price - target_ask) <= self.FAST_REPRICE_TICKS * tick
             )
             if bid_unchanged and ask_unchanged:
                 return  # Keep queue priority
@@ -1051,7 +1102,10 @@ class AlphaBot2(BaseBot):
         utilization = abs(position) / max(self.max_position, 1)
         scale = 1.0 - clamp(utilization, 0.0, 0.8)
         edge_boost = 1.0 + 0.4 * clamp(edge / max(self.TAKE_EDGE, 1.0), 0.0, 1.5)
-        return max(0, int(round(self.base_order_size * scale * edge_boost)))
+        raw_size = self.base_order_size * 0.6 * scale * edge_boost
+        if raw_size < 0.75:
+            return 0
+        return max(1, int(round(raw_size)))
 
     def _arb_size_cap(self, edge: float, take_edge: float) -> int:
         return max(
@@ -1164,7 +1218,7 @@ class AlphaBot2(BaseBot):
 
     def _poll_books_if_stale(self) -> dict[str, OrderBook]:
         now = time.monotonic()
-        if now - self.last_book_poll_at < 5.0:
+        if now - self.last_book_poll_at < 1.0:
             with self._lock:
                 return dict(self.books)
 
